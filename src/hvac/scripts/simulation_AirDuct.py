@@ -40,22 +40,22 @@ class AirDuctModel:
 
 # ── Simulation ────────────────────────────────────────────────────────────────
 
-q_fresh    = 0.5   # [m³/s]
-cross_area = 0.5   # [m²]
+q_fresh    = 0.72634   # [m³/s]
+cross_area = 0.5*0.5   # [m²]
 
 duct = AirDuctModel(
     volume_flow_rate  = q_fresh,
     cross_section_area= cross_area,
-    duct_length       = 5.0,
-    num_segments      = 5,
+    duct_length       = 0.06,
+    num_segments      = 1,
 )
 duct.set_initial_temperature(20.0)   # start at 20 °C
 
 # Inlet: step from 20 °C → 40 °C at t = 5 s
 def inlet_fn(t):
-    return 20.0 + 273.15 if t < 5.0 else 40.0 + 273.15   # [K]
+    return 10 + 273.15   # [K]
 
-t_end  = 20.0
+t_end  = 0.5
 t_eval = np.linspace(0, t_end, 600)
 
 def ode(t, T):
@@ -75,9 +75,6 @@ colors = plt.cm.viridis(np.linspace(0, 0.85, duct.K))
 for k in range(duct.K):
     ax.plot(sol.t, T_segments[k], color=colors[k],
             linewidth=2, label=f'Segment {k+1}  (z={((k+1.0)*duct.dz):.1f} m)')
-
-# Mark the step change
-ax.axvline(5, color='red', linestyle='--', linewidth=1.2, label='Inlet step (20→40 °C)')
 
 ax.set_xlabel('Time  [s]', fontsize=12)
 ax.set_ylabel('Temperature  [°C]', fontsize=12)
