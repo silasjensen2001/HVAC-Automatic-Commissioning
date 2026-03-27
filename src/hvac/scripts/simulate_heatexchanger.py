@@ -10,7 +10,7 @@ model = NonlinearHeatExchanger(
     num_segments               = 5,
     num_pipes                  = 10,
     heat_transfer_coefficient  = 10.0,
-    Area_radiator              = 13.2,
+    Area_radiator              = 13.2 /40,
     cross_area_water           = 0.000201,
     heat_exchanger_depth       = 0.06,
     heat_exchanger_width       = 0.5,
@@ -22,8 +22,8 @@ model = NonlinearHeatExchanger(
 K = model.K   # number of segments
 
 # ── Initial conditions ────────────────────────────────────────────────────────
-T_init     = np.full(K, 20.0 + 273.15)   # air   [K]
-theta_init = np.full(K,  66.0 + 273.15)   # water [K]
+T_init     = np.full(K, 10.0 + 273.15)   # air   [K]
+theta_init = np.full(K,  10.0 + 273.15)   # water [K]
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs: constant throughout ──────────────────────────────────────────────
@@ -34,7 +34,7 @@ def u_fn(t):
     return np.array([T_in, theta_in])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 10
+t_end  = 80
 t_eval = np.linspace(0, t_end, 1000)
 
 def ode(t, x):

@@ -214,7 +214,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
     def _mass_flow_dry_air(self, T: float, relative_humidity:float) -> float:
 
-        partial_pressure_dry_air =  self._partial_pressure_vapor(T, relative_humidity)
+        partial_pressure_dry_air = self.p - self._partial_pressure_vapor(T, relative_humidity)
         omega = self._omega(T, relative_humidity)
         mass_flow_dry_air = (partial_pressure_dry_air * self.volume_flow_wet_air * (1-omega)) / (self.gas_constant * self.T_operational_in_cooler)
 
@@ -276,8 +276,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         advective_term_dry_air = mass_flow_dry_air * self.c_pa * (T_in - T_out)
         advective_term_vapor = mass_flow_vapor * self.c_pv * (T_in - T_out)
 
-        #numerator = -newtons_cooling_term + advective_term_dry_air + advective_term_vapor
-        numerator =  advective_term_dry_air + advective_term_vapor
+        numerator = -newtons_cooling_term + advective_term_dry_air + advective_term_vapor
 
         # Denominator terms
         denominator = mass_dry_air * (self.c_pa + omega * self.c_pv)
