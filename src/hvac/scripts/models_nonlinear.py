@@ -53,6 +53,7 @@ class BaseHeatExchanger(ABC):
         self.T_operational_in_cooler = 28 + 273.15 #!!!! Carsten said 28 degrees outside??????
         self.T_operational_out_heater = 20 + 273.15 #!!!
         self.T_operational_in_heater = self.T_operational_out_cooler #!!!
+        self.relative_humidity_in_system = 0.5 #!!! Assumed constant relative humidity in to the system
 
         self.p = 101325 # [Pa] - Atmospheric pressure
 
@@ -78,6 +79,10 @@ class BaseHeatExchanger(ABC):
         self.Valve_position_max = 1
         self.pressure_differential = 0.75 # [Bar]
         self.water_supply_T = water_supply_T # [K] - Water supply temperature
+
+        # Mass and mass flows of dry air
+        self.mass_dry_air = self._mass_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
+        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
 
         # Shared coupling coefficients
         self.Newton_coeff   = self._newton_coupling_coeff()
@@ -225,6 +230,13 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
     def _omega(self, T:float, relative_humidity:float) -> float:
         return  0.622 * (self._partial_pressure_vapor(T, relative_humidity)/(self.p-self._partial_pressure_vapor(T, relative_humidity)))
 
+    def _mass_dry_air(self, T: float, relative_humidity:float) -> float:
+        partial_pressure_vapor = self._partial_pressure_vapor(T, relative_humidity)
+        partial_pressure_dry_air = self.p - partial_pressure_vapor
+        omega = self._omega(T, relative_humidity)
+        mass_dry_air = (partial_pressure_dry_air * (self.delta_x * self.cross_area_wet_air * (1-omega)))/(self.gas_constant * T)
+        return mass_dry_air
+
     def _mass_flow_dry_air(self, T: float, relative_humidity:float) -> float:
 
         partial_pressure_dry_air = self.p - self._partial_pressure_vapor(T, relative_humidity)
@@ -237,26 +249,19 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         # Cooler specific assumptions 
         relative_humidity = 1
         L = 2500.9 * 1000 # [J/kg]
-        
-        partial_pressure_vapor = self._partial_pressure_vapor(self.T_operational_out_cooler, relative_humidity)
-        partial_pressure_dry_air = self.p - partial_pressure_vapor
-        
+                
         # omega
         omega_in = self._omega(T_in, relative_humidity)
         omega_out = self._omega(T_out, relative_humidity) # [Kg/Kg]
         domega_dT_out = self._domega_dT_out(T_out, relative_humidity)
-
-        # Mass
-        mass_dry_air = (partial_pressure_dry_air * (self.delta_x * self.cross_area_wet_air * (1-omega_out)))/(self.gas_constant * self.T_operational_out_cooler)
-
+        
         # Mass flows
-        mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, relative_humidity)
-        mass_flow_vapor_in = omega_in * mass_flow_dry_air
-        mass_flow_vapor_out = omega_out * mass_flow_dry_air
+        mass_flow_vapor_in = omega_in * self.mass_flow_dry_air
+        mass_flow_vapor_out = omega_out * self.mass_flow_dry_air
 
         # Numerator terms
         newtons_cooling_term = self.Newton_coeff * (T_out - theta)
-        advective_term_dry_air = mass_flow_dry_air * self.c_pa * (T_in - T_out)
+        advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
         heat_vapor_in = mass_flow_vapor_in * (self.c_pv * T_in + L)
         heat_vapor_out = mass_flow_vapor_out * (self.c_pv * T_out + L)
         heat_condensate = (mass_flow_vapor_in - mass_flow_vapor_out) * self.c_pc * T_out
@@ -264,34 +269,29 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         numerator = -newtons_cooling_term + advective_term_dry_air + heat_vapor_in - heat_vapor_out - heat_condensate
         
         # Denominator terms
-        denominator = mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * T_out + L) * domega_dT_out - domega_dT_out * self.c_pc * T_out)
+        denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * T_out + L) * domega_dT_out - domega_dT_out * self.c_pc * T_out)
 
         return numerator / denominator
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
         # Heater specific assumptions 
         relative_humidity = self._saturation_pressure(T_in) / self._saturation_pressure(T_out)
-        partial_pressure_vapor_out = self._partial_pressure_vapor(self.T_operational_out_heater, relative_humidity)
-        partial_pressure_dry_air_out = self.p - partial_pressure_vapor_out
         
         # omega
         omega = self._omega(T_in, relative_humidity)
 
-        # Mass
-        mass_dry_air = (partial_pressure_dry_air_out * (self.delta_x * self.cross_area_wet_air * (1-omega)))/(self.gas_constant * self.T_operational_out_heater)
-
         # Mass flows
-        mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, relative_humidity)
-        mass_flow_vapor = omega * mass_flow_dry_air
+        mass_flow_vapor = omega * self.mass_flow_dry_air
+  
         # Numerator terms
         newtons_cooling_term = ((self.alpha * self.A_r)/self.delta_x) * (T_out - theta)
-        advective_term_dry_air = mass_flow_dry_air * self.c_pa * (T_in - T_out)
+        advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
         advective_term_vapor = mass_flow_vapor * self.c_pv * (T_in - T_out)
 
         numerator = -newtons_cooling_term + advective_term_dry_air + advective_term_vapor
 
         # Denominator terms
-        denominator = mass_dry_air * (self.c_pa + omega * self.c_pv)
+        denominator = self.mass_dry_air * (self.c_pa + omega * self.c_pv)
 
         return numerator / denominator
 
