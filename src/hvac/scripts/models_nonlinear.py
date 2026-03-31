@@ -31,6 +31,7 @@ class BaseHeatExchanger(ABC):
         heat_exchanger_height: float,
         volume_flow_wet_air: float,
         volume_flow_water: float,
+        water_supply_T: float = 5 + 273.15
     ):
         # type of heat exchanger (e.g. "cooler" or "heater")
         self.type         = type
@@ -71,8 +72,19 @@ class BaseHeatExchanger(ABC):
         # Gas constant
         self.gas_constant = 287.056 # [m^2/(K * s^2)]
 
+        # Valve parameters
+        self.Kvs = 3 # max flow rate at fully open valve [m³/h]
+        self.water_inlet_flow = volume_flow_water  * 3600 #Flow rate in [m³/h]
+        self.Valve_position_max = 1
+        self.pressure_differential = 0.75 # [Bar]
+        self.water_supply_T = water_supply_T # [K] - Water supply temperature
+
         # Shared coupling coefficients
         self.Newton_coeff   = self._newton_coupling_coeff()
+
+
+        print(f"Initialized {self.type} with {self.K} segments and {num_pipes} pipes.")
+        
 
     def _newton_coupling_coeff(self) -> float:
         return self.alpha * self.A_r /self.delta_x
@@ -185,6 +197,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._check_valve_model()
 
     def _saturation_pressure(self, T: float) -> float:
         T_celsius = T - 273.15
@@ -219,7 +232,6 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         mass_flow_dry_air = (partial_pressure_dry_air * self.volume_flow_wet_air * (1-omega)) / (self.gas_constant * self.T_operational_in_cooler)
 
         return mass_flow_dry_air
-
 
     def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
         # Cooler specific assumptions 
@@ -258,7 +270,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
         # Heater specific assumptions 
-        relative_humidity = 1 #!!!!!!
+        relative_humidity = self._saturation_pressure(T_in) / self._saturation_pressure(T_out)
         partial_pressure_vapor_out = self._partial_pressure_vapor(self.T_operational_out_heater, relative_humidity)
         partial_pressure_dry_air_out = self.p - partial_pressure_vapor_out
         
@@ -283,24 +295,38 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
         return numerator / denominator
 
-
     def _water_segment_derivative(self, T: float, theta_in: float, theta_out: float) -> float:
         nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
         ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
 
         return nc * T - (nc + ac) * theta_out + ac * theta_in
 
+    def _valve_model(self, Valve_position: float, theta_return: float) -> float:
+        # Valve model
+        theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
+        return theta_inlet
+
+    def _check_valve_model(self):
+        # Does valve model make sense?
+        coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
+        if coefficient > 1:
+            # Throw error
+            raise ValueError(f"Valve model coefficient {coefficient:.2f} > 1. Cannot supply more flow, than the inlet is set to take")
+            
+    
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
         Compute dx/dt for the full nonlinear system.
 
         Args:
             x (np.ndarray): [T_1..T_K, θ_1..θ_K], shape (2K,)
-            u (np.ndarray): [T_in, θ_in],           shape (2,)
+            u (np.ndarray): [T_in, valve_position],           shape (2,)
         """
         T     = x[:self.K]
         theta = x[self.K:]
-        T_in, theta_in = u[0], u[1]
+        T_in, valve_position = u[0], u[1]
+
+        theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
 
         if self.type == "cooler":
             dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k]) for k in range(self.K)])
