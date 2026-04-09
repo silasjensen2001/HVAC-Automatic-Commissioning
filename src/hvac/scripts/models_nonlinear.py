@@ -23,15 +23,14 @@ class BaseHeatExchanger(ABC):
         type: str,
         num_segments: int,
         num_pipes: int,
-        heat_transfer_coefficient: float,
-        Area_radiator: float,
+        gamma: float,
         cross_area_water: float,
         heat_exchanger_depth: float,
         heat_exchanger_width: float,
         heat_exchanger_height: float,
         volume_flow_wet_air: float,
-        volume_flow_water: float,
-        water_supply_T: float = 5 + 273.15
+        water_supply_T: float,
+        Kvs: float,
     ):
         # type of heat exchanger (e.g. "cooler" or "heater")
         self.type         = type
@@ -58,10 +57,9 @@ class BaseHeatExchanger(ABC):
         self.p = 101325 # [Pa] - Atmospheric pressure
 
         self.volume_flow_wet_air = volume_flow_wet_air / (num_segments * num_pipes)
-        self.volume_flow_water = volume_flow_water / num_pipes
+        self.volume_flow_water = (Kvs / 3600) / num_pipes
 
-        self.alpha        = heat_transfer_coefficient
-        self.A_r          = Area_radiator / num_segments
+        self.gamma = gamma / num_segments # product of heat_transfer_coefficient and area radiator
         
         self.water_density = 1000 # [kg/m³] - Density of water at room temperature
 
@@ -74,15 +72,11 @@ class BaseHeatExchanger(ABC):
         self.gas_constant = 287.056 # [m^2/(K * s^2)]
 
         # Valve parameters
-        self.Kvs = 3 # max flow rate at fully open valve [m³/h]
-        self.water_inlet_flow = volume_flow_water  * 3600 #Flow rate in [m³/h]
+        self.Kvs = Kvs # max flow rate at fully open valve [m³/h]
+        self.water_inlet_flow = Kvs #Flow rate in [m³/h]
         self.Valve_position_max = 1
-        self.pressure_differential = 0.75 # [Bar]
+        self.pressure_differential = 1.0 # [Bar]
         self.water_supply_T = water_supply_T # [K] - Water supply temperature
-
-        # Mass and mass flows of dry air
-        self.mass_dry_air = self._mass_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
-        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
 
         # Shared coupling coefficients
         self.Newton_coeff   = self._newton_coupling_coeff()
@@ -90,9 +84,23 @@ class BaseHeatExchanger(ABC):
 
         print(f"Initialized {self.type} with {self.K} segments and {num_pipes} pipes.")
         
-
+    def _check_valve_model(self):
+        # Does valve model make sense?
+        coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
+        if coefficient > 1:
+            # Throw error
+            raise ValueError(f"Valve model coefficient {coefficient:.2f} > 1. Cannot supply more flow, than the inlet is set to take")
+         
     def _newton_coupling_coeff(self) -> float:
-        return self.alpha * self.A_r /self.delta_x
+        return self.gamma /self.delta_x
+
+    # Water segment is linear in both cooler and heater, so we can reuse the same function for both models
+    def _water_segment_derivative(self, T: float, theta_in: float, theta_out: float) -> float:
+        nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
+        ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
+
+        return nc * T - (nc + ac) * theta_out + ac * theta_in
+
 
     @property
     def num_states(self) -> int:
@@ -115,84 +123,68 @@ class BaseHeatExchanger(ABC):
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 class LinearHeatExchanger(BaseHeatExchanger):
-    """
-    Linear state-space heat exchanger model.
-    Intended for control design (LQR, MPC, pole placement, etc.)
-
-        ẋ = A·x + B·u
-    """
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
+        self.theta_return_operation_point = 26.611 + 273.15 # [K] return water temperature at operation point
 
-        # Build sub-blocks then assemble
-        A_air,   B_air   = self._construct_air_state_block()
-        A_water, B_water = self._construct_water_state_block()
-        self.A, self.B = self._assemble(A_air, B_air, A_water, B_water)
+    def _check_valve_model(self):
+        # Does valve model make sense?
+        coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
+        if coefficient > 1:
+            # Throw error
+            raise ValueError(f"Valve model coefficient {coefficient:.2f} > 1. Cannot supply more flow, than the inlet is set to take")
+    
+    def _valve_model_linear(self, Valve_position: float, theta_return: float) -> float:
+        k = (self.Kvs * np.sqrt(self.pressure_differential)) / self.water_inlet_flow
+        return k * (self.water_supply_T - self.theta_return_operation_point) * Valve_position + (1-k * self.valve_operation_point) * theta_return
+    
+    def _valve_model(self, Valve_position: float, theta_return: float) -> float:
+        # Valve model
+        theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
+        return theta_inlet
 
-    def _construct_air_state_block(self):
-        """
-        Air dynamics sub-block.
+    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
+        return 0
 
-        Returns:
-            A_air  : (K, 2K)
-            B_air  : (2K, 1) — air inlet T_in at row 0
-        """
-        nc = self.Newton_coeff
-        ac = self.volume_flow_water / (self.cross_area_water * self.delta_x)
-
-        A_air = np.zeros((self.K, self.K * 2))
-        for k in range(self.K):
-            # Self term
-            A_air[k, k]  = -(nc + ac)
-            # Water to air coupling
-            A_air[k, self.K + k] = nc
-            # Upwind advection from previous segment
-            if k > 0:
-                A_air[k, k - 1] = ac
-
-        B_air = np.zeros((self.K * 2, 1))
-        B_air[0, 0] = ac
-
-        return A_air, B_air
-
-    def _construct_water_state_block(self):
-        """
-        Water dynamics sub-block.
-
-        Returns:
-            A_water  : (K, 2K)
-            B_water  : (2K, 1) — water inlet θ_in at row K
-        """
-        nc = self.Newton_coeff
-        ac = self.volume_flow_water / (self.cross_area_water * self.delta_x)
-
-        A_water = np.zeros((self.K, self.K * 2))
-        for k in range(self.K):
-            # Air to water coupling
-            A_water[k, k] = nc
-            # Self term
-            A_water[k, self.K + k] = -(nc + ac)
-            # Upwind advection from previous segment
-            if k > 0:
-                A_water[k, self.K + k - 1] = ac
-
-        B_water = np.zeros((self.K * 2, 1))
-        B_water[self.K, 0] = ac
-
-        return A_water, B_water
-
-    def _assemble(self, A_air, B_air, A_water, B_water):
-        """Assemble full (2K, 2K) A and (2K, 2) B from sub-blocks."""
-        A = np.zeros((self.N, self.N))
-        A[:self.K, :] = A_air
-        A[self.K:, :] = A_water
-
-        B = np.hstack([B_air, B_water])
-        return A, B
-
+    def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, segment: int) -> float:
+        coeffs = {
+            0: (2591.0, -32140.0, 29540.0, 1195.0),
+            1: (2591.0, -32140.0, 29540.0, 1180.0),
+            2: (2591.0, -32140.0, 29540.0, 1172.0),
+            3: (2591.0, -32140.0, 29540.0, 1156.0),
+            4: (2591.0, -32140.0, 29540.0, 1156.0),
+        }
+        a, b, c, d = coeffs[segment]
+        return a * T_in + b * T_out + c * theta + d
+    
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        return self.A @ x + self.B @ u
+        """
+        Compute dx/dt for the full nonlinear system.
+
+        Args:
+            x (np.ndarray): [T_1..T_K, θ_1..θ_K], shape (2K,)
+            u (np.ndarray): [T_in, valve_position],           shape (2,)
+        """
+        T     = x[:self.K]
+        theta = x[self.K:]
+        T_in, valve_position = u[0], u[1]
+
+        theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
+
+        if self.type == "cooler":
+            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k]) for k in range(self.K)])
+        else: # heater
+            dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k], k) for k in range(self.K)])
+
+        dtheta_dt = np.array([self._water_segment_derivative(T[k],
+                theta_in if k == 0 else theta[k - 1],
+                theta[k],
+            )
+            for k in range(self.K)
+        ])
+
+        return np.concatenate([dT_dt, dtheta_dt])
 
 class NonlinearHeatExchanger(BaseHeatExchanger):
     """
@@ -202,6 +194,11 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        # Mass and mass flows of dry air
+        self.mass_dry_air = self._mass_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
+        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
+
         self._check_valve_model()
 
     def _saturation_pressure(self, T: float) -> float:
@@ -278,13 +275,13 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         relative_humidity = self._saturation_pressure(T_in) / self._saturation_pressure(T_out)
         
         # omega
-        omega = self._omega(T_in, relative_humidity)
+        omega = self._omega(T_out, relative_humidity)
 
         # Mass flows
         mass_flow_vapor = omega * self.mass_flow_dry_air
   
         # Numerator terms
-        newtons_cooling_term = ((self.alpha * self.A_r)/self.delta_x) * (T_out - theta)
+        newtons_cooling_term = (self.gamma/self.delta_x) * (T_out - theta)
         advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
         advective_term_vapor = mass_flow_vapor * self.c_pv * (T_in - T_out)
 
@@ -295,25 +292,11 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
         return numerator / denominator
 
-    def _water_segment_derivative(self, T: float, theta_in: float, theta_out: float) -> float:
-        nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
-        ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
-
-        return nc * T - (nc + ac) * theta_out + ac * theta_in
-
     def _valve_model(self, Valve_position: float, theta_return: float) -> float:
         # Valve model
         theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
         return theta_inlet
 
-    def _check_valve_model(self):
-        # Does valve model make sense?
-        coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
-        if coefficient > 1:
-            # Throw error
-            raise ValueError(f"Valve model coefficient {coefficient:.2f} > 1. Cannot supply more flow, than the inlet is set to take")
-            
-    
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
         Compute dx/dt for the full nonlinear system.

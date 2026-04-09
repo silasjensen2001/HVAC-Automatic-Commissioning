@@ -1,11 +1,11 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from models_nonlinear import NonlinearHeatExchanger
+from models_nonlinear import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Instantiate cooler ────────────────────────────────────────────────────────
 
-model = NonlinearHeatExchanger(
+model = LinearHeatExchanger(
     type                       = "heater",
     num_segments               = 5,
     num_pipes                  = 10,
@@ -73,7 +73,7 @@ ax.plot(sol.t, T_air.mean(axis=0), color="black", linestyle="--",
 ax.axhline(T_in - 273.15, color="sienna", linestyle=":", linewidth=1.0,
            label=f"Air inlet ({T_in - 273.15:.0f} °C)")
 ax.set_ylabel("Air temperature  [°C]", fontsize=12)
-ax.set_title("Nonlinear Heater — Air Segment Temperatures", fontsize=13)
+ax.set_title("Linear Heater — Air Segment Temperatures", fontsize=13)
 ax.legend(fontsize=9, loc="center right", ncol=2)
 ax.grid(True, alpha=0.35)
 
@@ -86,7 +86,7 @@ ax.plot(sol.t, theta_in_c, color="navy", linestyle=":", linewidth=2.0,
     label="Water inlet θ_in(t)")
 ax.set_xlabel("Time  [s]", fontsize=12)
 ax.set_ylabel("Water temperature  [°C]", fontsize=12)
-ax.set_title("Nonlinear Heater — Water Segment Temperatures", fontsize=13)
+ax.set_title("Linear Heater — Water Segment Temperatures", fontsize=13)
 ax.legend(fontsize=9, loc="center right", ncol=2)
 ax.grid(True, alpha=0.35)
 

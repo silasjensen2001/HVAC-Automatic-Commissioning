@@ -8,15 +8,15 @@ model = NonlinearHeatExchanger(
     type                       = "heater",
     num_segments               = 5,
     num_pipes                  = 10,
-    heat_transfer_coefficient  = 10.0,
-    Area_radiator              = 13.2,
+    gamma                      = 715.44, # [W/K] product of heat transfer coefficient and area radiator
     cross_area_water           = 0.000201,
     heat_exchanger_depth       = 0.06,
     heat_exchanger_width       = 0.5,
     heat_exchanger_height      = 0.5,
-    volume_flow_wet_air        = 0.72634,
-    volume_flow_water          = 0.00086,
-    water_supply_T             = 65 + 273.15,
+    volume_flow_wet_air        = 0.72634,   # [m³/s]
+    volume_flow_water          = 0.00096,  # [m³/s]
+    water_supply_T             = 65 + 273.15, # [K]
+    Kvs                        = 3.44 # [m³/h] valve flow coefficient at fully open
 )
 
 K    = model.K
