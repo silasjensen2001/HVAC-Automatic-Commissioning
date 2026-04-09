@@ -34,7 +34,7 @@ def u_fn(t):
     return np.array([T_in, valve_position])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 100
+t_end  = 800
 t_eval = np.linspace(0, t_end, 10000)
 
 def ode(t, x):
@@ -98,7 +98,7 @@ print("\n=== Final time temperatures ===")
 print(f"  {'Segment':<10} {'Air [°C]':>12} {'Water [°C]':>12}")
 print(f"  {'-'*36}")
 for k in range(K):
-    print(f"  {k+1:<10} {T_air[k, -1]:>12.3f} {T_water[k, -1]:>12.3f}")
+    print(f"  {k+1:<10} {T_air[k, -1]:>12.8f} {T_water[k, -1]:>12.8f}")
 print(f"\n  Air inlet (const)   : {T_in     - 273.15:.1f} °C")
 print(f"  Water inlet final   : {theta_in_c[-1]:.3f} °C")
 print(f"  Water inlet range   : {theta_in_c.min():.3f} to {theta_in_c.max():.3f} °C")

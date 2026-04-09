@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 
+
 class BaseHeatExchanger(ABC):
     """
     Abstract base class for heat exchanger models.
@@ -47,12 +48,12 @@ class BaseHeatExchanger(ABC):
         self.cross_area_water = cross_area_water
         self.cross_area_wet_air = (segment_depth * segment_height) - cross_area_water
         self.delta_x = segment_width
-        
-        self.T_operational_out_cooler = 10 + 273.15 #!!! 
+
+        self.T_operational_out_cooler = 9.9 + 273.15 #!!! 
         self.T_operational_in_cooler = 28 + 273.15 #!!!! Carsten said 28 degrees outside??????
         self.T_operational_out_heater = 20 + 273.15 #!!!
         self.T_operational_in_heater = self.T_operational_out_cooler #!!!
-        self.relative_humidity_in_system = 0.5 #!!! Assumed constant relative humidity in to the system
+        self.relative_humidity_in_system = 0.6 #!!! Assumed constant relative humidity in to the system
 
         self.p = 101325 # [Pa] - Atmospheric pressure
 
@@ -128,6 +129,9 @@ class LinearHeatExchanger(BaseHeatExchanger):
         self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
         self.theta_return_operation_point = 26.611 + 273.15 # [K] return water temperature at operation point
 
+        # Construct the system
+        self.A, self.B, self.Offset = self._construct_state_space()
+
     def _check_valve_model(self):
         # Does valve model make sense?
         coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
@@ -135,6 +139,15 @@ class LinearHeatExchanger(BaseHeatExchanger):
             # Throw error
             raise ValueError(f"Valve model coefficient {coefficient:.2f} > 1. Cannot supply more flow, than the inlet is set to take")
     
+    def _check_stability_and_rank(self, A: np.ndarray):
+        # Check if all eigenvalues of A have negative real part
+        eigenvalues = np.linalg.eigvals(A)
+        if np.any(eigenvalues.real >= 0):
+            raise ValueError("System is not stable. Eigenvalues:\n", eigenvalues)
+        # Check if A is full rank
+        if np.linalg.matrix_rank(A) < A.shape[0]:
+            raise ValueError("System matrix A is not full rank. Rank:", np.linalg.matrix_rank(A))
+
     def _valve_model_linear(self, Valve_position: float, theta_return: float) -> float:
         k = (self.Kvs * np.sqrt(self.pressure_differential)) / self.water_inlet_flow
         return k * (self.water_supply_T - self.theta_return_operation_point) * Valve_position + (1-k * self.valve_operation_point) * theta_return
@@ -148,17 +161,105 @@ class LinearHeatExchanger(BaseHeatExchanger):
         return 0
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, segment: int) -> float:
-        coeffs = {
-            0: (2591.0, -32140.0, 29540.0, 1195.0),
-            1: (2591.0, -32140.0, 29540.0, 1180.0),
-            2: (2591.0, -32140.0, 29540.0, 1172.0),
-            3: (2591.0, -32140.0, 29540.0, 1156.0),
-            4: (2591.0, -32140.0, 29540.0, 1156.0),
-        }
+        coeffs = {0: (47.445533, -29594.354278, 29542.454314, 1260.826680),
+                1: (47.483811, -29594.354278, 29542.454314, 1249.992126),
+                2: (47.521761, -29594.354278, 29542.454314, 1239.250538),
+                3: (47.559384, -29594.354278, 29542.454314, 1228.601363),
+                4: (47.596683, -29594.354278, 29542.454314, 1218.043659),}
         a, b, c, d = coeffs[segment]
         return a * T_in + b * T_out + c * theta + d
     
+    def _construct_water_state_block(self):
+        nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
+        ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
+
+        # Shape (K, 2K), gives water dynamics in terms of both air and water states
+        A_water = np.zeros((self.K, self.K * 2))
+        for k in range(self.K):
+            # Air to water coupling
+            A_water[k, k] = nc
+
+            # Self term
+            A_water[k, self.K + k] = -(nc + ac)
+            # Upwind advection
+            if k > 0:
+                A_water[k, self.K + k - 1] = ac
+
+        # B_water: inlet boundary condition θ_0_in drives the first water segment
+        B_water = np.zeros((self.N, 1))
+        B_water[self.K, 0] = ac
+
+        # No constant offset in water dynamics
+        offset_water = np.zeros((self.K, 1))
+
+        return A_water, B_water, offset_water
+    
+    def _construct_air_state_block(self):
+        """
+        Construct the air sub-block of the state-space A matrix.
+
+        Returns:
+            A_air : np.ndarray, shape (K, 2K)
+                Sub-block for air dynamics. Columns 0..K-1 are air-to-air coupling,
+                columns K..2K-1 are air-to-water coupling.
+                To assemble the full A matrix:
+                    A[:K, :] = A_air
+        """
+
+        coeffs = {0: (47.445533, -29594.354278, 29542.454314, 1260.826680),
+                1: (47.483811, -29594.354278, 29542.454314, 1249.992126),
+                2: (47.521761, -29594.354278, 29542.454314, 1239.250538),
+                3: (47.559384, -29594.354278, 29542.454314, 1228.601363),
+                4: (47.596683, -29594.354278, 29542.454314, 1218.043659),}
+
+        #Construct the air sub-block of the A matrix and offset vector for constant terms in the air dynamics
+        A_air    = np.zeros((self.K, self.K * 2))
+        B_air    = np.zeros((self.N, 1))
+        offset_air = np.zeros((self.K, 1))
+
+        for k in range(self.K):
+            a, b, c, d = coeffs[k]
+            A_air[k, k]          =  b
+            A_air[k, self.K + k] =  c
+            B_air[k, 0]          =  a
+            offset_air[k, 0]     =  d
+
+        return A_air, B_air, offset_air
+
+    def _construct_state_space(self):
+        
+        A = np.zeros((self.N, self.N))
+        B = np.zeros((self.N, 2))
+        Offset = np.zeros((self.N, 2))
+
+
+        A_air, B_air, offset_air = self._construct_air_state_block()
+        A_water, B_water, offset_water = self._construct_water_state_block()
+
+        # A
+        ## Air dynamics
+        A[:self.K, :] = A_air
+
+        ## Water dynamics
+        A[self.K:, :] = A_water
+        
+        # B 
+        B = np.hstack([B_air, B_water])
+
+        # Constant offset
+        Offset = np.vstack([offset_air, offset_water])
+
+        return A, B, Offset
+    
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+    
+        # Valve model — get water inlet from valve position and return temperature
+        theta_in = self._valve_model(Valve_position=u[1], theta_return=x[self.N - 1])
+        u_linear = np.array([u[0], theta_in])  # [T_in, theta_in]
+    
+        return self.A @ x + self.B @ u_linear + self.Offset.flatten()
+    
+    def derivatives_old(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
         Compute dx/dt for the full nonlinear system.
 
@@ -200,6 +301,9 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
 
         self._check_valve_model()
+
+        print(f"diff evaluated in point {self._air_heater_segment_derivative(self.T_operational_in_heater, 27.53079433, 27.68566257)}")
+
 
     def _saturation_pressure(self, T: float) -> float:
         T_celsius = T - 273.15

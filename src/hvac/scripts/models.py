@@ -231,7 +231,7 @@ class AirDuctModel:
         Returns:
             dTdt (ndarray): Temperature derivatives [K/s]
         """
-        return self.A @ T + self.B.flatten() * u
+        return self.A @ T + self.B.flatten() * u +
 
 class Junction:
     """
