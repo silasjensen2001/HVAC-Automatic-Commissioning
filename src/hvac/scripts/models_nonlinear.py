@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
+import time
 import numpy as np
+import time
 
 
 
@@ -130,7 +132,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
         self.theta_return_operation_point = 26.611 + 273.15 # [K] return water temperature at operation point
 
         # Construct the system
-        self.A, self.B, self.Offset = self._construct_state_space()
+        if self.type == "heater":
+            self.A, self.B, self.Offset = self._construct_state_space_heater()
+        else:
+            self.A, self.B, self.Offset = self._construct_state_space_cooler()
 
     def _check_valve_model(self):
         # Does valve model make sense?
@@ -157,19 +162,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
         theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
         return theta_inlet
 
-    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
-        return 0
-
-    def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, segment: int) -> float:
-        coeffs = {0: (47.445533, -29594.354278, 29542.454314, 1260.826680),
-                1: (47.483811, -29594.354278, 29542.454314, 1249.992126),
-                2: (47.521761, -29594.354278, 29542.454314, 1239.250538),
-                3: (47.559384, -29594.354278, 29542.454314, 1228.601363),
-                4: (47.596683, -29594.354278, 29542.454314, 1218.043659),}
-        a, b, c, d = coeffs[segment]
-        return a * T_in + b * T_out + c * theta + d
-    
-    def _construct_water_state_block(self):
+    def _construct_water_state_block_heater(self):
         nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
         ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
 
@@ -194,7 +187,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_water, B_water, offset_water
     
-    def _construct_air_state_block(self):
+    def _construct_air_state_block_heater(self):
         """
         Construct the air sub-block of the state-space A matrix.
 
@@ -226,15 +219,15 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_air, B_air, offset_air
 
-    def _construct_state_space(self):
+    def _construct_state_space_heater(self):
         
         A = np.zeros((self.N, self.N))
         B = np.zeros((self.N, 2))
         Offset = np.zeros((self.N, 2))
 
 
-        A_air, B_air, offset_air = self._construct_air_state_block()
-        A_water, B_water, offset_water = self._construct_water_state_block()
+        A_air, B_air, offset_air = self._construct_air_state_block_heater()
+        A_water, B_water, offset_water = self._construct_water_state_block_heater()
 
         # A
         ## Air dynamics
@@ -251,6 +244,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A, B, Offset
     
+
+    def _construct_state_space_cooler(self):
+        return self._construct_state_space_heater()
+
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
     
         # Valve model — get water inlet from valve position and return temperature
@@ -302,8 +299,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
         self._check_valve_model()
 
-        print(f"diff evaluated in point {self._air_heater_segment_derivative(self.T_operational_in_heater, 27.53079433, 27.68566257)}")
-
+        print(f"diff evaluated in point {self._air_heater_segment_derivative(self.T_operational_in_heater, 27.53079433 + 273.15, 27.68566257 + 273.15)}")
 
     def _saturation_pressure(self, T: float) -> float:
         T_celsius = T - 273.15
@@ -389,10 +385,14 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
         advective_term_vapor = mass_flow_vapor * self.c_pv * (T_in - T_out)
 
+        print(f"newtons_cooling_term: {newtons_cooling_term:.2f}, advective_term_dry_air: {advective_term_dry_air:.2f}, advective_term_vapor: {advective_term_vapor:.2f}")
+
         numerator = -newtons_cooling_term + advective_term_dry_air + advective_term_vapor
 
         # Denominator terms
         denominator = self.mass_dry_air * (self.c_pa + omega * self.c_pv)
+
+        print(f"denominator: {denominator:.2f}")    
 
         return numerator / denominator
 
