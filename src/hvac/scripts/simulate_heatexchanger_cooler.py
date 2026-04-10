@@ -1,35 +1,33 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from models_nonlinear import NonlinearHeatExchanger
+from models import NonlinearHeatExchanger
 
 # ── Instantiate cooler ────────────────────────────────────────────────────────
-
 model = NonlinearHeatExchanger(
     type                       = "cooler",
     num_segments               = 5,
     num_pipes                  = 10,
-    heat_transfer_coefficient  = 10.0,
-    Area_radiator              = 13.2,
-    cross_area_water           = 0.000201,
+    gamma                      = 951.87, # [W/K] product of heat transfer coefficient and area radiator
+    cross_area_water           = 0.000201, # [m²] cross-sectional area for water flow
     heat_exchanger_depth       = 0.06,
     heat_exchanger_width       = 0.5,
     heat_exchanger_height      = 0.5,
     volume_flow_wet_air        = 0.72634,   # [m³/s]
-    volume_flow_water          = 0.000027,  # [m³/s]
-    water_supply_T             = 2.0 + 273.15,  # [K] chilled water supply
+    water_supply_T             = 4.0 + 273.15, # [K]
+    Kvs                        = 1.6471 # [m³/h] valve flow coefficient at fully open
 )
 
 K = model.K   # number of segments
 
-# ── Initial conditions ────────────────────────────────────────────────────────
+# ── Initial conditions ─────────────────────────────────½───────────────────────
 T_init     = np.full(K, 28.0 + 273.15)   # air   [K]
 theta_init = np.full(K, 28.0 + 273.15)   # water [K]
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs: constant throughout ──────────────────────────────────────────────
 T_in           = 28.0 + 273.15   # [K]  warm humid air inlet
-valve_position = 1.0              # [0–1]  valve opening for water flow
+valve_position = 0.95              # [0–1]  valve opening for water flow
 
 def u_fn(t):
     return np.array([T_in, valve_position])
@@ -44,7 +42,7 @@ def ode(t, x):
 sol = solve_ivp(
     ode, (0, t_end), x0,
     t_eval=t_eval,
-    method="RK45",
+    method="Radau",
     rtol=1e-6,
     atol=1e-8,
 )
@@ -99,7 +97,7 @@ print("\n=== Final segment temperatures ===")
 print(f"  {'Segment':<10} {'Air [°C]':>12} {'Water [°C]':>12}")
 print(f"  {'-'*36}")
 for k in range(K):
-    print(f"  {k+1:<10} {T_air[k, -1]:>12.3f} {T_water[k, -1]:>12.3f}")
+    print(f"  {k+1:<10} {T_air[k, -1]:>12.8f} {T_water[k, -1]:>12.8f}")
 print(f"\n  Air inlet (const)    : {T_in - 273.15:.1f} °C")
 print(f"  Water supply (const) : {model.water_supply_T - 273.15:.1f} °C")
 print(f"  Water inlet final    : {theta_in_c[-1]:.3f} °C")

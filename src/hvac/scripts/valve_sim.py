@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-from models_nonlinear import NonlinearHeatExchanger
+from models import NonlinearHeatExchanger
 
 # ── Instantiate heater ────────────────────────────────────────────────────────
 model = NonlinearHeatExchanger(

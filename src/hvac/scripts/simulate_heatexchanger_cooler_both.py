@@ -7,17 +7,17 @@ from models import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Shared parameters ─────────────────────────────────────────────────────────
 params = dict(
-    type                  = "heater",
-    num_segments          = 5,
-    num_pipes             = 10,
-    gamma                 = 951.87,
-    cross_area_water      = 0.000201,
-    heat_exchanger_depth  = 0.06,
-    heat_exchanger_width  = 0.5,
-    heat_exchanger_height = 0.5,
-    volume_flow_wet_air   = 0.72634,
-    water_supply_T        = 66.9 + 273.15,
-    Kvs                   = 1.6471,
+    type                       = "cooler",
+    num_segments               = 5,
+    num_pipes                  = 10,
+    gamma                      = 951.87, # [W/K] product of heat transfer coefficient and area radiator
+    cross_area_water           = 0.000201, # [m²] cross-sectional area for water flow
+    heat_exchanger_depth       = 0.06,
+    heat_exchanger_width       = 0.5,
+    heat_exchanger_height      = 0.5,
+    volume_flow_wet_air        = 0.72634,   # [m³/s]
+    water_supply_T             = 4.0 + 273.15, # [K]
+    Kvs                        = 1.6471 # [m³/h] valve flow coefficient at fully open
 )
 
 linear_model    = LinearHeatExchanger(**params)
@@ -60,19 +60,19 @@ print(f"\nSaved linear model data to: {csv_path}")
 K = linear_model.K
 
 # ── Initial conditions ────────────────────────────────────────────────────────
-T_init     = np.full(K, 9.9 + 273.15)
-theta_init = np.full(K, 9.9 + 273.15)
+T_init     = np.full(K, 28 + 273.15)
+theta_init = np.full(K, 28 + 273.15)
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
-T_in           = 9.9 + 273.15
-valve_position = 0.02
+T_in           = 28 + 273.15
+valve_position = 0.95
 
 def u_fn(t):
     return np.array([T_in, valve_position])
 
 # ── Integrate both ────────────────────────────────────────────────────────────
-t_end  = 500
+t_end  = 30
 t_eval = np.linspace(0, t_end, 10000)
 
 sol_lin = solve_ivp(
