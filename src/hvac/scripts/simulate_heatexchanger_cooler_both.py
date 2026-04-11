@@ -2,7 +2,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
-import csv
 from models import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Shared parameters ─────────────────────────────────────────────────────────
@@ -28,34 +27,15 @@ A = linear_model.A
 B = linear_model.B
 offset = linear_model.Offset
 
-print("=== Linear model matrices ===")
-print("A matrix:")
-print(A)
-print("\nB matrix:")
-print(B)
-print("\nOffset vector:")
-print(offset)
 
 data_dir = Path(__file__).resolve().parent.parent / "data"
 data_dir.mkdir(parents=True, exist_ok=True)
-csv_path = data_dir / "heater_both_linear_model.csv"
+type_label = params["type"].capitalize()
+data_path = data_dir / f"Heatexchanger_{type_label}_both_linear_model.mat"
 
-with csv_path.open("w", newline="") as csv_file:
-    writer = csv.writer(csv_file)
-    writer.writerow(["matrix", "row", "col", "value"])
+linear_model._export_state_space(data_path)
 
-    for row_index in range(A.shape[0]):
-        for col_index in range(A.shape[1]):
-            writer.writerow(["A", row_index, col_index, A[row_index, col_index]])
-
-    for row_index in range(B.shape[0]):
-        for col_index in range(B.shape[1]):
-            writer.writerow(["B", row_index, col_index, B[row_index, col_index]])
-
-    for row_index, value in enumerate(np.ravel(offset)):
-        writer.writerow(["offset", row_index, "", value])
-
-print(f"\nSaved linear model data to: {csv_path}")
+print(f"\nSaved linear model data to: {data_path}")
 
 K = linear_model.K
 

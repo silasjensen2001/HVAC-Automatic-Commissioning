@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import time
 import numpy as np
 import time
+import scipy.io as sio
 
 
 
@@ -136,7 +137,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
             self.theta_return_operation_point = 5.56611657 + 273.15 # [K] return water temperature at operation point
         
         self.A, self.B, self.Offset = self._construct_state_space()
-    
+
+    def _export_state_space(self, file_path: str):
+        sio.savemat(file_path, {"A": self.A, "B": self.B, "Offset": self.Offset})
+
     def _check_valve_model(self):
         # Does valve model make sense?
         coefficient = (self.Kvs/self.water_inlet_flow) * np.sqrt(self.pressure_differential)
@@ -156,16 +160,27 @@ class LinearHeatExchanger(BaseHeatExchanger):
     def _valve_model_linear(self, Valve_position: float, theta_return: float) -> float:
         valve_model_operation_point = self._valve_model(Valve_position=self.valve_operation_point, theta_return=self.theta_return_operation_point)
         k = (self.Kvs * np.sqrt(self.pressure_differential)) / (self.water_inlet_flow * self.Valve_position_max)
+
         return valve_model_operation_point + k * (self.water_supply_T - self.theta_return_operation_point) * (Valve_position - self.valve_operation_point) + (1-k * self.valve_operation_point) * (theta_return - self.theta_return_operation_point)
-    
+
     def _valve_model(self, Valve_position: float, theta_return: float) -> float:
         # Valve model
         theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
         return theta_inlet
-
+    
     def _construct_water_state_block(self):
         nc       = self.Newton_coeff * (1/(self.c_pc * self.water_density * self.cross_area_water))
         ac       = self.volume_flow_water / (self.cross_area_water * self.delta_x)
+
+        # Valve model - Given as: valve_model_operation_point + valve_coefficient_1 * (Valve_position - self.valve_operation_point) + valve_coefficient_2 * (theta_return - self.theta_return_operation_point)
+        valve_model_operation_point = self._valve_model(Valve_position=self.valve_operation_point, theta_return=self.theta_return_operation_point)
+        k = (self.Kvs * np.sqrt(self.pressure_differential)) / (self.water_inlet_flow * self.Valve_position_max)
+        valve_coefficient_1 = k * (self.water_supply_T - self.theta_return_operation_point)
+        valve_coefficient_2 = (1-k * self.valve_operation_point)
+
+        valve_offset = ac * (valve_model_operation_point - valve_coefficient_1 * self.valve_operation_point - valve_coefficient_2 * self.theta_return_operation_point)
+        theta_1_return_coupling = ac * valve_coefficient_2
+        valve_position_coefficient = ac * valve_coefficient_1
 
         # Shape (K, 2K), gives water dynamics in terms of both air and water states
         A_water = np.zeros((self.K, self.K * 2))
@@ -179,12 +194,16 @@ class LinearHeatExchanger(BaseHeatExchanger):
             if k > 0:
                 A_water[k, self.K + k - 1] = ac
 
+        # Direct couple theta_return to the first water segment through the valve model
+        A_water[0, self.N - 1] = theta_1_return_coupling
+        
         # B_water: inlet boundary condition θ_0_in drives the first water segment
         B_water = np.zeros((self.N, 1))
-        B_water[self.K, 0] = ac
+        B_water[self.K, 0] = valve_position_coefficient
 
         # No constant offset in water dynamics
         offset_water = np.zeros((self.K, 1))
+        offset_water[0, 0] = valve_offset
 
         return A_water, B_water, offset_water
     
@@ -255,45 +274,8 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A, B, Offset
     
-
-    def _construct_state_space_cooler(self):
-        return self._construct_state_space_heater()
-
     def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-    
-        # Valve model — get water inlet from valve position and return temperature
-        theta_in = self._valve_model_linear(Valve_position=u[1], theta_return=x[self.N - 1])
-        u_linear = np.array([u[0], theta_in])  # [T_in, theta_in]
-    
-        return self.A @ x + self.B @ u_linear + self.Offset.flatten()
-    
-    def derivatives_old(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        """
-        Compute dx/dt for the full nonlinear system.
-
-        Args:
-            x (np.ndarray): [T_1..T_K, θ_1..θ_K], shape (2K,)
-            u (np.ndarray): [T_in, valve_position],           shape (2,)
-        """
-        T     = x[:self.K]
-        theta = x[self.K:]
-        T_in, valve_position = u[0], u[1]
-
-        theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
-
-        if self.type == "cooler":
-            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k]) for k in range(self.K)])
-        else: # heater
-            dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k], k) for k in range(self.K)])
-
-        dtheta_dt = np.array([self._water_segment_derivative(T[k],
-                theta_in if k == 0 else theta[k - 1],
-                theta[k],
-            )
-            for k in range(self.K)
-        ])
-
-        return np.concatenate([dT_dt, dtheta_dt])
+        return self.A @ x + self.B @ u + self.Offset.flatten()
 
 class NonlinearHeatExchanger(BaseHeatExchanger):
     """
