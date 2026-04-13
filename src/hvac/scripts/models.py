@@ -4,6 +4,7 @@ import numpy as np
 import time
 import scipy.io as sio
 
+# - - - - - - - - - - - - - - - - Heat Exchanger - - - - - - - - - - - - - - - -
 class BaseHeatExchanger(ABC):
     """
     Abstract base class for heat exchanger models.
@@ -121,8 +122,6 @@ class BaseHeatExchanger(ABC):
         Returns:
             dxdt (np.ndarray): State derivatives,                 shape (2K,)
         """
-
-# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
 class LinearHeatExchanger(BaseHeatExchanger):
     def __init__(self, **kwargs):
@@ -415,3 +414,114 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         ])
 
         return np.concatenate([dT_dt, dtheta_dt])
+    
+# - - - - - - - - - - - - - - - - Airduct - - - - - - - - - - - - - - - -
+class AirDuctModel:
+    def __init__(self, volume_flow_rate=1, cross_section_area=2,
+                 duct_length=10, num_segments=10):
+        """
+        Initialize the air duct model.
+
+        Args:
+            volume_flow_rate (float):   Volumetric flow rate [m³/s]
+            cross_section_area (float): Cross-sectional area of the duct [m²]
+            duct_length (float):        Length of the duct [m]
+            num_segments (int):         Number of segments to discretize into
+        """
+        self.q_a   = volume_flow_rate
+        self.A_a   = cross_section_area
+        self.L     = duct_length
+        self.K     = num_segments
+        self.N     = self.K
+        self.dz    = self.L / self.K
+        self.alpha = self.q_a / (self.A_a * self.dz)
+
+        self.initial_state = np.zeros(self.N)
+        self.A, self.B     = self._construct_state_space()
+
+    @property
+    def num_states(self):
+        """Total number of states — 1 per segment."""
+        return self.N
+
+    def _construct_state_space(self):
+        """
+        Construct state-space matrices for dT/dt = A·T + B·u.
+
+        Returns:
+            A (ndarray): State matrix [N x N]
+            B (ndarray): Input matrix [N x 1]
+        """
+        A = np.zeros((self.K, self.K))
+        for k in range(self.K):
+            A[k, k] = -self.alpha
+            if k > 0:
+                A[k, k - 1] = self.alpha
+
+        B = np.zeros((self.K, 1))
+        B[0, 0] = self.alpha
+        return A, B
+
+    def set_initial_temperature(self, temperature_C):
+        """
+        Set uniform initial temperature for all segments.
+
+        Args:
+            temperature_C (float): Initial temperature [°C]
+        """
+        self.initial_state = np.full(self.N, temperature_C + 273.15)
+
+    def derivatives(self, T, u):
+        """
+        Compute dT/dt given current state and input.
+
+        Args:
+            T (ndarray): Current segment temperatures [K]
+            u (float):   Inlet temperature [K]
+
+        Returns:
+            dTdt (ndarray): Temperature derivatives [K/s]
+        """
+        return self.A @ T + self.B.flatten() * u
+
+# - - - - - - - - - - - - - - - - Junction - - - - - - - - - - - - - - - -
+class Junction:
+    """
+    Stateless N-input mixing junction.
+
+    Computes a mass-flow-weighted outlet temperature from multiple inlets.
+    No states — purely algebraic at each timestep.
+    """
+    num_states = 0
+    K          = 0
+
+    def mix(self, inputs):
+        """
+        Compute mixed outlet temperature.
+
+        Args:
+            inputs (list of (float, float)): (flow_rate [m³/s], temperature [K]) pairs
+
+        Returns:
+            T_mixed (float): Mass-flow-weighted mixed temperature [K]
+        """
+        total_q = sum(q for q, _ in inputs)
+        if total_q == 0:
+            raise ValueError("Total flow rate into junction is zero.")
+        return sum(q * T for q, T in inputs) / total_q
+
+# - - - - - - - - - - - - - - - - Sink - - - - - - - - - - - - - - - -
+class Sink:
+    """
+    Terminal flow sink. Absorbs a fixed flow rate. No states.
+    Used as a bookkeeping node to confirm global flow conservation.
+    """
+    num_states = 0
+    K          = 0
+
+    def __init__(self, flow_rate):
+        """
+        Args:
+            flow_rate (float): Flow rate absorbed by this sink [m³/s]
+        """
+        self.q = flow_rate
