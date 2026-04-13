@@ -4,8 +4,6 @@ import numpy as np
 import time
 import scipy.io as sio
 
-
-
 class BaseHeatExchanger(ABC):
     """
     Abstract base class for heat exchanger models.

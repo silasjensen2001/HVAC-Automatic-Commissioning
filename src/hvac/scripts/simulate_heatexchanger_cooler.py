@@ -33,7 +33,7 @@ def u_fn(t):
     return np.array([T_in, valve_position])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 80
+t_end  = 10
 t_eval = np.linspace(0, t_end, 1000)
 
 def ode(t, x):
