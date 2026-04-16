@@ -6,27 +6,21 @@ from models import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Shared parameters ─────────────────────────────────────────────────────────
 params = dict(
-    type                       = "cooler",
-    num_segments               = 5,
-    num_pipes                  = 10,
-    gamma                      = 951.87, # [W/K] product of heat transfer coefficient and area radiator
-    cross_area_water           = 0.000201, # [m²] cross-sectional area for water flow
-    heat_exchanger_depth       = 0.06,
-    heat_exchanger_width       = 0.5,
-    heat_exchanger_height      = 0.5,
-    volume_flow_wet_air        = 0.72634,   # [m³/s]
-    water_supply_T             = 4.0 + 273.15, # [K]
-    Kvs                        = 1.6471 # [m³/h] valve flow coefficient at fully open
+    type                  = "heater",
+    num_segments          = 5,
+    num_pipes             = 10,
+    gamma                 = 951.87,
+    cross_area_water      = 0.000201,
+    heat_exchanger_depth  = 0.06,
+    heat_exchanger_width  = 0.5,
+    heat_exchanger_height = 0.5,
+    volume_flow_wet_air   = 0.72634,
+    water_supply_T        = 66.9 + 273.15,
+    Kvs                   = 1.6471,
 )
 
 linear_model    = LinearHeatExchanger(**params)
 nonlinear_model = NonlinearHeatExchanger(**params)
-
-# Extract A, B, and offset matrix
-A = linear_model.A
-B = linear_model.B
-offset = linear_model.Offset
-
 
 data_dir = Path(__file__).resolve().parent.parent / "data"
 data_dir.mkdir(parents=True, exist_ok=True)
@@ -37,32 +31,36 @@ linear_model._export_state_space(data_path)
 
 print(f"\nSaved linear model data to: {data_path}")
 
+
 K = linear_model.K
 
 # ── Initial conditions ────────────────────────────────────────────────────────
-T_init     = np.full(K, 28 + 273.15)
-theta_init = np.full(K, 28 + 273.15)
+T_init     = np.full(K, 9.9 + 273.15)
+theta_init = np.full(K, 9.9 + 273.15)
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
-T_in           = 28 + 273.15
-valve_position = 0.95
+T_in           = 9.9 + 273.15
+valve_position = 0.02
 
 def u_fn(t):
-    return np.array([T_in, valve_position])
+    return np.array([valve_position])
+
+def d_fn(t):
+    return np.array([T_in])
 
 # ── Integrate both ────────────────────────────────────────────────────────────
-t_end  = 30
+t_end  = 500
 t_eval = np.linspace(0, t_end, 10000)
 
 sol_lin = solve_ivp(
-    lambda t, x: linear_model.derivatives(x, u_fn(t)),
+    lambda t, x: linear_model.derivatives(x, u_fn(t), d_fn(t)),
     (0, t_end), x0, t_eval=t_eval,
     method="Radau", rtol=1e-6, atol=1e-8,
 )
 
 sol_nl = solve_ivp(
-    lambda t, x: nonlinear_model.derivatives(x, u_fn(t)),
+    lambda t, x: nonlinear_model.derivatives(x, u_fn(t), d_fn(t)),
     (0, t_end), x0, t_eval=t_eval,
     method="Radau", rtol=1e-6, atol=1e-8,
 )

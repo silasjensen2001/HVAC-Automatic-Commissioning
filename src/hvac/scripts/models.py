@@ -4,21 +4,116 @@ import numpy as np
 import time
 import scipy.io as sio
 
+# - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
+class HVAC:
+    def __init__(self, components: list):
+        """
+        Args:
+            components: Ordered list of LinearHeatExchanger (or compatible) instances.
+                        Air flows through them in series: components[0] → components[1] → ...
+        """
+  
+        self.components = components
+        self.total_states = sum(c.num_states for c in components)
+
+        self.coordinate_shift = np.zeros((self.total_states,)) 
+
+        self.A, self.B_u, self.B_d, self.C = self._assemble_system()
+
+    def _export_state_space(self, file_path: str):
+        sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "B_d": self.B_d, "x_shift": self.coordinate_shift, "C": self.C})
+
+    def _assemble_system(self):
+        """
+        Assemble full block state-space from component instances.
+        Each component must expose: A, B_u, B_d, C, Offset
+        """
+        
+        A = np.zeros((self.total_states, self.total_states))
+        B_u = np.zeros((self.total_states, len(self.components))) # Single input per component 
+        B_d = np.zeros((self.total_states, 1))
+        C = np.zeros((len(self.components), self.total_states))
+        Offset = np.zeros((self.total_states, 1))
+
+        # Local offset and last output for coupling between components
+        offset = 0
+        prev_C = None
+        prev_offset = None
+        prev_n = None
+
+        for comp_idx, component in enumerate(self.components):
+            n = component.num_states
+            
+            # Block diagonal self-dynamics
+            A[offset:offset+n, offset:offset+n] = component.A
+            
+            # Series air coupling from previous component
+            if prev_C is not None:
+                coupling = component.B_d @ prev_C  # (n x n_prev)
+                A[offset:offset+n, prev_offset:prev_offset+prev_n] = coupling
+            
+            # Input matrix
+            B_u[offset:offset+n, comp_idx:comp_idx+1] += component.B_u
+            
+            # Disturbance matrix
+            if offset == 0:
+                B_d[offset:offset+n, :] += component.B_d  # only used for first component
+            
+            # Output matrix
+            C[comp_idx, offset:offset+n] = component.C[0, :]
+
+            # Offset
+            Offset[offset:offset+n, :] += component.Offset
+            
+            prev_C = component.C
+            prev_offset = offset
+            prev_n = n
+            offset += n
+
+        self._compute_frame_shift(A, Offset)
+
+        return A, B_u, B_d, C
+
+    def _check_stability_and_rank(self, A: np.ndarray):
+        # Check if all eigenvalues of A have negative real part
+        eigenvalues = np.linalg.eigvals(A)
+        if np.any(eigenvalues.real >= 0):
+            raise ValueError("System is not stable. Eigenvalues:\n", eigenvalues)
+        # Check if A is full rank
+        if np.linalg.matrix_rank(A) < A.shape[0]:
+            raise ValueError("System matrix A is not full rank. Rank:", np.linalg.matrix_rank(A))
+
+    def _compute_frame_shift(self, A: np.ndarray, Offset: np.ndarray):
+        self._check_stability_and_rank(A)
+        self.coordinate_shift = np.linalg.solve(-A, Offset).flatten()
+
+    def _to_original_frame(self, x_shifted: np.ndarray) -> np.ndarray:
+        return x_shifted + self.coordinate_shift
+
+    def _to_shifted_frame(self, x: np.ndarray) -> np.ndarray:
+        return x - self.coordinate_shift
+
+    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
+        z = self._to_shifted_frame(x)
+        return self.A @ z + self.B_u @ u + self.B_d @ d
+
 # - - - - - - - - - - - - - - - - Heat Exchanger - - - - - - - - - - - - - - - -
 class BaseHeatExchanger(ABC):
     """
     Abstract base class for heat exchanger models.
     Subclasses implement either a linear (matrix) or nonlinear (ODE) formulation.
-    Both expose the same derivatives(x, u) interface so the simulator
+    Both expose the same derivatives(x, u, d) interface so the simulator
     does not need to know which one it is running.
 
     State vector: x = [T_1, ..., T_K, θ_1, ..., θ_K]
         T_k   : air temperature in segment k   [K]
         θ_k   : water temperature in segment k [K]
 
-    Input vector: u = [T_in, θ_in]
+    Control vector: u = [valve_position]
+        valve_position : water valve opening    [0..1]
+
+    Disturbance vector: d = [T_in]
         T_in  : air inlet temperature           [K]
-        θ_in  : water inlet temperature         [K]
     """
 
     def __init__(
@@ -111,13 +206,14 @@ class BaseHeatExchanger(ABC):
         return self.N
 
     @abstractmethod
-    def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         """
-        Compute dx/dt given current state x and input u.
+        Compute dx/dt given current state x, control input u, and disturbance d.
 
         Args:
             x (np.ndarray): State vector [T_1..T_K, θ_1..θ_K], shape (2K,)
-            u (np.ndarray): Input vector [T_in, θ_in],           shape (2,)
+            u (np.ndarray): Input vector [valve_position],          shape (1,)
+            d (np.ndarray): Disturbance vector [T_in],              shape (1,)
 
         Returns:
             dxdt (np.ndarray): State derivatives,                 shape (2K,)
@@ -126,6 +222,7 @@ class BaseHeatExchanger(ABC):
 class LinearHeatExchanger(BaseHeatExchanger):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
         if self.type == "heater":
             self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
             self.theta_return_operation_point = 26.611 + 273.15 # [K] return water temperature at operation point
@@ -133,10 +230,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
             self.valve_operation_point = 0.95 # [0-1] valve opening for water flow
             self.theta_return_operation_point = 5.56611657 + 273.15 # [K] return water temperature at operation point
         
-        self.A, self.B, self.Offset = self._construct_state_space()
+        self.A, self.B_u, self.B_d, self.Offset, self.C  = self._construct_matrix_state_space()
 
     def _export_state_space(self, file_path: str):
-        sio.savemat(file_path, {"A": self.A, "B": self.B, "Offset": self.Offset})
+        sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "B_d": self.B_d, "Offset": self.Offset, "C": self.C})
 
     def _check_valve_model(self):
         # Does valve model make sense?
@@ -195,8 +292,8 @@ class LinearHeatExchanger(BaseHeatExchanger):
         A_water[0, self.N - 1] = theta_1_return_coupling
         
         # B_water: inlet boundary condition θ_0_in drives the first water segment
-        B_water = np.zeros((self.N, 1))
-        B_water[self.K, 0] = valve_position_coefficient
+        B_water = np.zeros((self.K, 1))
+        B_water[0, 0] = valve_position_coefficient
 
         # No constant offset in water dynamics
         offset_water = np.zeros((self.K, 1))
@@ -235,7 +332,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         #Construct the air sub-block of the A matrix and offset vector for constant terms in the air dynamics
         A_air    = np.zeros((self.K, self.K * 2))
-        B_air    = np.zeros((self.N, 1))
+        B_air    = np.zeros((self.K, 1))
         offset_air = np.zeros((self.K, 1))
 
         for k in range(self.K):
@@ -247,11 +344,13 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_air, B_air, offset_air
 
-    def _construct_state_space(self):
+    def _construct_matrix_state_space(self):
         
-        A = np.zeros((self.N, self.N))
-        B = np.zeros((self.N, 2))
-        Offset = np.zeros((self.N, 2))
+        A = np.zeros((self.N, self.N)) # State matrix
+        B_u = np.zeros((self.N, 1)) # Input matrix for valve position - Controllable input
+        B_d = np.zeros((self.N, 1)) # Input matrix for air inlet temperature - Disturbance input
+        C = np.zeros((1, self.N)) # Output matrix
+        Offset = np.zeros((self.N, 1))
 
         A_air, B_air, offset_air = self._construct_air_state_block()
         A_water, B_water, offset_water = self._construct_water_state_block()
@@ -264,15 +363,18 @@ class LinearHeatExchanger(BaseHeatExchanger):
         A[self.K:, :] = A_water
         
         # B 
-        B = np.hstack([B_air, B_water])
-
+        B_u[self.K:,0] = B_water.flatten()
+        B_d[0:self.K, 0] = B_air.flatten()
+        
         # Constant offset
         Offset = np.vstack([offset_air, offset_water])
 
-        return A, B, Offset
+        C[0, :self.K] = 1 / self.K # Average air temperature across segments as output
+
+        return A, B_u, B_d, Offset, C
     
-    def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        return self.A @ x + self.B @ u + self.Offset.flatten()
+    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
+        return self.A @ x + self.B_u @ u + self.B_d @ d + self.Offset.flatten()
 
 class NonlinearHeatExchanger(BaseHeatExchanger):
     """
@@ -288,8 +390,6 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
 
         self._check_valve_model()
-
-        print(f"diff evaluated in point {self._air_cooler_segment_derivative(self.T_operational_in_cooler, 8.47563504 + 273.15, 5.56611657 + 273.15)}")
 
     def _saturation_pressure(self, T: float) -> float:
         T_celsius = T - 273.15
@@ -387,17 +487,19 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         theta_inlet = (self.Kvs/self.water_inlet_flow) * (Valve_position/self.Valve_position_max) * np.sqrt(self.pressure_differential) * (self.water_supply_T - theta_return) + theta_return
         return theta_inlet
 
-    def derivatives(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         """
         Compute dx/dt for the full nonlinear system.
 
         Args:
             x (np.ndarray): [T_1..T_K, θ_1..θ_K], shape (2K,)
-            u (np.ndarray): [T_in, valve_position],           shape (2,)
+            u (np.ndarray): [valve_position],           shape (1,)
+            d (np.ndarray): [T_in],                     shape (1,)
         """
         T     = x[:self.K]
         theta = x[self.K:]
-        T_in, valve_position = u[0], u[1]
+        T_in = d[0] # Air inlet temperature is treated as a disturbance input
+        valve_position = u[0] # Valve position is the control input
 
         theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
 
@@ -437,7 +539,7 @@ class AirDuctModel:
         self.alpha = self.q_a / (self.A_a * self.dz)
 
         self.initial_state = np.zeros(self.N)
-        self.A, self.B     = self._construct_state_space()
+        self.A, self.B = self._construct_state_space()
 
     @property
     def num_states(self):
