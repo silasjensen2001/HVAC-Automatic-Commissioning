@@ -1,8 +1,12 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
-from models import LinearHeatExchanger, NonlinearHeatExchanger
+from ..models import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Shared parameters ─────────────────────────────────────────────────────────
 params = dict(
