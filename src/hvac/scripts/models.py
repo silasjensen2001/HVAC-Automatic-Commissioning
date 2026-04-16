@@ -146,18 +146,15 @@ class BaseHeatExchanger(ABC):
         self.cross_area_wet_air = (segment_depth * segment_height) - cross_area_water
         self.delta_x = segment_width
 
-        self.T_operational_out_cooler = 9.9 + 273.15 #!!! 
-        self.T_operational_in_cooler = 28 + 273.15 #!!!! Carsten said 28 degrees outside??????
-        self.T_operational_out_heater = 20 + 273.15 #!!!
-        self.T_operational_in_heater = self.T_operational_out_cooler #!!!
-        self.relative_humidity_in_system = 0.6 #!!! Assumed constant relative humidity in to the system
+        self.T_operational_in_cooler = 28 + 273.15 
+        self.relative_humidity_in_system = 0.832
 
         self.p = 101325 # [Pa] - Atmospheric pressure
 
         self.volume_flow_wet_air = volume_flow_wet_air / (num_segments * num_pipes)
         self.volume_flow_water = (Kvs / 3600) / num_pipes
 
-        self.gamma = gamma / (num_segments * num_pipes) # product of heat_transfer_coefficient and area radiator #!!===
+        self.gamma = gamma / (num_segments * num_pipes) # product of heat_transfer_coefficient and area radiator 
         
         self.water_density = 1000 # [kg/m³] - Density of water at room temperature
 
@@ -428,7 +425,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
         partial_pressure_dry_air = self.p - self._partial_pressure_vapor(T, relative_humidity)
         omega = self._omega(T, relative_humidity)
-        mass_flow_dry_air = (partial_pressure_dry_air * self.volume_flow_wet_air * (1-omega)) / (self.gas_constant * self.T_operational_in_cooler)
+        mass_flow_dry_air = (partial_pressure_dry_air * self.volume_flow_wet_air * (1-omega)) / (self.gas_constant * T)
 
         return mass_flow_dry_air
 
