@@ -3,6 +3,7 @@ import time
 import numpy as np
 import time
 import scipy.io as sio
+from scipy.optimize import root
 
 # - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
 class HVAC:
@@ -219,6 +220,7 @@ class BaseHeatExchanger(ABC):
 class LinearHeatExchanger(BaseHeatExchanger):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self._kwargs = kwargs  # store so we can spin up NonlinearHeatExchanger internally
 
         if self.type == "heater":
             self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
@@ -298,7 +300,16 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_water, B_water, offset_water
     
-    def _construct_air_state_block(self):
+    def _find_equilibrium(self, nonlinear: "NonlinearHeatExchanger", u_op: np.ndarray, d_op: np.ndarray) -> np.ndarray:
+        x0 = np.full(nonlinear.N, 15 + 273.15)
+        result = root(lambda x: nonlinear.derivatives(x, u_op, d_op), x0)
+        if not result.success:
+            raise ValueError(f"Equilibrium search failed: {result.message}")
+        print(f"  Equilibrium found. Max residual: {np.abs(nonlinear.derivatives(result.x, u_op, d_op)).max():.2e}")
+        return result.x
+
+
+    def _construct_air_state_block_old(self):
         """
         Construct the air sub-block of the state-space A matrix.
 
@@ -339,6 +350,49 @@ class LinearHeatExchanger(BaseHeatExchanger):
             A_air[k, self.K + k] =  c
             B_air[k, 0]          =  a
             offset_air[k, 0]     =  d
+
+        return A_air, B_air, offset_air
+
+    def _construct_air_state_block(self):
+        eps = 1e-5
+        u_op = np.array([self.valve_operation_point])
+        d_op = np.array([self.T_operational_in_cooler])
+
+        # Spin up nonlinear version with identical parameters
+        nonlinear = NonlinearHeatExchanger(**self._kwargs)
+        x_eq      = self._find_equilibrium(nonlinear, u_op, d_op)
+
+        T_eq     = x_eq[:self.K]   # air temperatures at equilibrium, one per segment
+        theta_eq = x_eq[self.K:]   # water temperatures at equilibrium, one per segment
+
+        seg_deriv = (nonlinear._air_cooler_segment_derivative if self.type == "cooler"
+                     else nonlinear._air_heater_segment_derivative)
+
+        A_air      = np.zeros((self.K, self.K * 2))
+        B_air      = np.zeros((self.K, 1))
+        offset_air = np.zeros((self.K, 1))
+
+        for k in range(self.K):
+            T_in_op  = self.T_operational_in_cooler
+            T_out_op = T_eq[k]
+            theta_op = theta_eq[k]
+
+            f0 = seg_deriv(T_in_op, T_out_op, theta_op)
+
+            # Central finite differences
+            a = (seg_deriv(T_in_op + eps, T_out_op, theta_op) - seg_deriv(T_in_op - eps, T_out_op, theta_op)) / (2*eps)
+            b = (seg_deriv(T_in_op, T_out_op + eps, theta_op) - seg_deriv(T_in_op, T_out_op - eps, theta_op)) / (2*eps)
+            c = (seg_deriv(T_in_op, T_out_op, theta_op + eps) - seg_deriv(T_in_op, T_out_op, theta_op - eps)) / (2*eps)
+
+            # Affine offset
+            d_const = f0 - a*T_in_op - b*T_out_op - c*theta_op
+
+            A_air[k, k]          = b   # ∂f/∂T_out — self damping
+            A_air[k, self.K + k] = c   # ∂f/∂theta — water coupling
+            B_air[k, 0]          = a   # ∂f/∂T_in  — disturbance gain
+            offset_air[k, 0]     = d_const
+
+            print(f"  Seg {k}: a={a:.6f}  b={b:.6f}  c={c:.6f}  d={d_const:.6f}")
 
         return A_air, B_air, offset_air
 

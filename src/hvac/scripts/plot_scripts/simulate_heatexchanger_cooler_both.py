@@ -6,7 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
-from ..models import LinearHeatExchanger, NonlinearHeatExchanger
+from models import LinearHeatExchanger, NonlinearHeatExchanger
 
 # ── Shared parameters ─────────────────────────────────────────────────────────
 params = dict(
@@ -25,20 +25,6 @@ params = dict(
 
 linear_model    = LinearHeatExchanger(**params)
 nonlinear_model = NonlinearHeatExchanger(**params)
-
-# Extract A, B, and offset matrix
-A = linear_model.A
-B = linear_model.B
-offset = linear_model.Offset
-
-data_dir = Path(__file__).resolve().parent.parent / "data"
-data_dir.mkdir(parents=True, exist_ok=True)
-type_label = params["type"].capitalize()
-data_path = data_dir / f"Heatexchanger_{type_label}_both_linear_model.mat"
-
-linear_model._export_state_space(data_path)
-
-print(f"\nSaved linear model data to: {data_path}")
 
 K = linear_model.K
 
