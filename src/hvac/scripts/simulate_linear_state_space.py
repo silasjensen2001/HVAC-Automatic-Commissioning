@@ -42,7 +42,7 @@ hvac = HVAC(components=[lin_cooler, lin_heater])
 
 # export model
 
-data_dir = Path(__file__).resolve().parent.parent / "data"
+data_dir = Path(__file__).resolve().parent.parent / "models/linear"
 data_dir.mkdir(parents=True, exist_ok=True)
 type_label = "HVAC"
 data_path = data_dir / f"{type_label}_model.mat"

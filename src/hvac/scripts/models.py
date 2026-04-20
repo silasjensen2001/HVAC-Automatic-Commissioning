@@ -148,6 +148,8 @@ class BaseHeatExchanger(ABC):
         self.delta_x = segment_width
 
         self.T_operational_in_cooler = 28 + 273.15 
+        self.T_operational_in_heater = 9.9 + 273.15
+        #self.relative_humidity_in_system = 0.5
         self.relative_humidity_in_system = 0.832
 
         self.p = 101325 # [Pa] - Atmospheric pressure
@@ -229,6 +231,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
             self.valve_operation_point = 0.95 # [0-1] valve opening for water flow
             self.theta_return_operation_point = 5.56611657 + 273.15 # [K] return water temperature at operation point
         
+        # Central difference parameters for linearization of air dynamics
+        self.eps = 1e-5
+        self.equilibrium_initial_guess = 15 + 273.15
+
         self.A, self.B_u, self.B_d, self.Offset, self.C  = self._construct_matrix_state_space()
 
     def _export_state_space(self, file_path: str):
@@ -301,67 +307,28 @@ class LinearHeatExchanger(BaseHeatExchanger):
         return A_water, B_water, offset_water
     
     def _find_equilibrium(self, nonlinear: "NonlinearHeatExchanger", u_op: np.ndarray, d_op: np.ndarray) -> np.ndarray:
-        x0 = np.full(nonlinear.N, 15 + 273.15)
+        x0 = np.full(nonlinear.N, self.equilibrium_initial_guess)
         result = root(lambda x: nonlinear.derivatives(x, u_op, d_op), x0)
         if not result.success:
             raise ValueError(f"Equilibrium search failed: {result.message}")
         print(f"  Equilibrium found. Max residual: {np.abs(nonlinear.derivatives(result.x, u_op, d_op)).max():.2e}")
         return result.x
 
-
-    def _construct_air_state_block_old(self):
-        """
-        Construct the air sub-block of the state-space A matrix.
-
-        Returns:
-            A_air : np.ndarray, shape (K, 2K)
-                Sub-block for air dynamics. Columns 0..K-1 are air-to-air coupling,
-                columns K..2K-1 are air-to-water coupling.
-                To assemble the full A matrix:
-                    A[:K, :] = A_air
-        """
-
-        # T_in, T:out, theta & offset
-        coeffs_heater = {0: (51.031779, -642.749051, 590.849086, 245.739827),
-                    1: (51.038702, -642.749051, 590.849086, 243.780358),
-                    2: (51.045569, -642.749051, 590.849086, 241.836515),
-                    3: (51.052382, -642.749051, 590.849086, 239.908171),
-                    4: (51.059140, -642.749051, 590.849086, 237.995202),}
-        
-        coeffs_cooler = { 0: (75.163477, -384.252031, 330.940166, -6657.889208),
-                    1: (74.620147, -381.967517, 328.663008, -6503.285878),
-                    2: (74.085541, -379.718538, 326.421018, -6351.007508),
-                    3: (73.559607, -377.504941, 324.214049, -6201.043639),
-                    4: (73.042286, -375.326552, 322.041931, -6053.382346),}
-
-        if self.type == "heater":
-            coeffs = coeffs_heater
-        else:
-            coeffs = coeffs_cooler
-
-        #Construct the air sub-block of the A matrix and offset vector for constant terms in the air dynamics
-        A_air    = np.zeros((self.K, self.K * 2))
-        B_air    = np.zeros((self.K, 1))
-        offset_air = np.zeros((self.K, 1))
-
-        for k in range(self.K):
-            a, b, c, d = coeffs[k]
-            A_air[k, k]          =  b
-            A_air[k, self.K + k] =  c
-            B_air[k, 0]          =  a
-            offset_air[k, 0]     =  d
-
-        return A_air, B_air, offset_air
-
     def _construct_air_state_block(self):
-        eps = 1e-5
-        u_op = np.array([self.valve_operation_point])
-        d_op = np.array([self.T_operational_in_cooler])
-
         # Spin up nonlinear version with identical parameters
         nonlinear = NonlinearHeatExchanger(**self._kwargs)
-        x_eq      = self._find_equilibrium(nonlinear, u_op, d_op)
+                
+        if self.type == "cooler":
+            T_in_op = self.T_operational_in_cooler
+        else:
+            # Heater 
+            T_in_op = self.T_operational_in_heater
+            
+        d_op = np.array([T_in_op])
+        u_op = np.array([self.valve_operation_point])
 
+        # Find equilibrium
+        x_eq      = self._find_equilibrium(nonlinear, u_op, d_op)
         T_eq     = x_eq[:self.K]   # air temperatures at equilibrium, one per segment
         theta_eq = x_eq[self.K:]   # water temperatures at equilibrium, one per segment
 
@@ -373,16 +340,15 @@ class LinearHeatExchanger(BaseHeatExchanger):
         offset_air = np.zeros((self.K, 1))
 
         for k in range(self.K):
-            T_in_op  = self.T_operational_in_cooler
             T_out_op = T_eq[k]
             theta_op = theta_eq[k]
 
             f0 = seg_deriv(T_in_op, T_out_op, theta_op)
 
             # Central finite differences
-            a = (seg_deriv(T_in_op + eps, T_out_op, theta_op) - seg_deriv(T_in_op - eps, T_out_op, theta_op)) / (2*eps)
-            b = (seg_deriv(T_in_op, T_out_op + eps, theta_op) - seg_deriv(T_in_op, T_out_op - eps, theta_op)) / (2*eps)
-            c = (seg_deriv(T_in_op, T_out_op, theta_op + eps) - seg_deriv(T_in_op, T_out_op, theta_op - eps)) / (2*eps)
+            a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op)) / (2*self.eps)
+            b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op)) / (2*self.eps)
+            c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps)) / (2*self.eps)
 
             # Affine offset
             d_const = f0 - a*T_in_op - b*T_out_op - c*theta_op

@@ -106,3 +106,23 @@ print(f"  {'-'*56}")
 for k in range(K):
     print(f"  {k+1:<10} {T_air_lin[k,-1]:>10.3f} {T_air_nl[k,-1]:>10.3f}"
           f" {T_water_lin[k,-1]:>12.3f} {T_water_nl[k,-1]:>12.3f}")
+    
+# ── MSE between linear and nonlinear ─────────────────────────────────────────
+mse_air   = np.mean((T_air_lin   - T_air_nl  )**2)
+mse_water = np.mean((T_water_lin - T_water_nl)**2)
+
+rmse_air   = np.sqrt(mse_air)
+rmse_water = np.sqrt(mse_water)
+
+print(f"\n=== Linear vs Nonlinear error (over full trajectory) ===")
+print(f"  Air   — MSE: {mse_air:.6f} °C²   RMSE: {rmse_air:.6f} °C")
+print(f"  Water — MSE: {mse_water:.6f} °C²   RMSE: {rmse_water:.6f} °C")
+
+# Per-segment RMSE if you want more detail
+print(f"\n=== Per-segment RMSE ===")
+print(f"  {'Segment':<10} {'Air RMSE':>12} {'Water RMSE':>12}")
+print(f"  {'-'*36}")
+for k in range(K):
+    rmse_air_k   = np.sqrt(np.mean((T_air_lin[k]   - T_air_nl[k]  )**2))
+    rmse_water_k = np.sqrt(np.mean((T_water_lin[k] - T_water_nl[k])**2))
+    print(f"  {k+1:<10} {rmse_air_k:>12.6f} {rmse_water_k:>12.6f}")
