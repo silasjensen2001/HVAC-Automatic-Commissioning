@@ -38,7 +38,9 @@ class StateFeedbackController:
 
     def _raw_input(self, x: np.ndarray, x_I: np.ndarray) -> np.ndarray:
         z = self.plant._to_shifted_frame(x)
-        return -(self.K_x @ z + self.K_I @ x_I)
+        u = -(self.K_x @ z + self.K_I @ x_I)
+        # print(u)
+        return u
 
     def compute_input(self, x: np.ndarray, x_I: np.ndarray) -> np.ndarray:
         """
@@ -53,26 +55,16 @@ class StateFeedbackController:
         """
         return np.clip(self._raw_input(x, x_I), self.u_min, self.u_max)
 
-    def integrator_derivative(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
-        """
-        Compute integrator derivative with conditional anti-windup.
-
-        Args:
-            x:   Physical state vector,    shape (n_states,).
-            x_I: Current integrator state, shape (n_outputs,).
-            r:   Reference/setpoint,       shape (n_outputs,).
-
-        Returns:
-            dx_I: Integrator derivative, shape (n_outputs,).
-        """
+    def integrator_derivative(self, x, x_I, r):
         error = r - self.outputs(x)
-        error[0] = -error[0]  # Invert error for cooler outlet temperature (we want it to be below the setpoint)
         u_raw = self._raw_input(x, x_I)
 
         anti_windup = np.ones(self.n_outputs)
 
         for i in range(self.n_outputs):
-            if (u_raw[i] >= self.u_max and error[i] > 0) or (u_raw[i] <= self.u_min and error[i] < 0):
+            du_dt_from_integrator = -(self.K_I[i, :] @ error)
+            if (u_raw[i] >= self.u_max and du_dt_from_integrator > 0) or \
+            (u_raw[i] <= self.u_min and du_dt_from_integrator < 0):
                 anti_windup[i] = 0.0
 
         return anti_windup * error

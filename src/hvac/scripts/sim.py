@@ -148,7 +148,7 @@ axes[1, 1].set_ylabel("Temperature [°C]")
 axes[1, 1].legend(fontsize=8)
 axes[1, 1].grid(True, alpha=0.35)
 
-"""
+
 axes[2, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
 axes[2, 0].set_title("Valve Opening — Cooler")
 axes[2, 0].set_ylabel("Opening [-]")
@@ -162,18 +162,18 @@ axes[2, 1].set_ylabel("Opening [-]")
 axes[2, 1].set_ylim(-0.05, 1.05)
 axes[2, 1].set_xlabel("Time [s]")
 axes[2, 1].grid(True, alpha=0.35)
-"""
-axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
-axes[2, 0].set_title("Integrator State — Cooler")
-axes[2, 0].set_ylabel("x_I [K·s]")
-axes[2, 0].set_xlabel("Time [s]")
-axes[2, 0].grid(True, alpha=0.35)
 
-axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
-axes[2, 1].set_title("Integrator State — Heater")
-axes[2, 1].set_ylabel("x_I [K·s]")
-axes[2, 1].set_xlabel("Time [s]")
-axes[2, 1].grid(True, alpha=0.35)
+# axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
+# axes[2, 0].set_title("Integrator State — Cooler")
+# axes[2, 0].set_ylabel("x_I [K·s]")
+# axes[2, 0].set_xlabel("Time [s]")
+# axes[2, 0].grid(True, alpha=0.35)
+
+# axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
+# axes[2, 1].set_title("Integrator State — Heater")
+# axes[2, 1].set_ylabel("x_I [K·s]")
+# axes[2, 1].set_xlabel("Time [s]")
+# axes[2, 1].grid(True, alpha=0.35)
 
 # Row 3 — Kx·x contribution
 for col, label in enumerate(["Cooler", "Heater"]):
