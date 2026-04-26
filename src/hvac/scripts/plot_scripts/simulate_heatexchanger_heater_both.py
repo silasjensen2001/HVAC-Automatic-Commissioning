@@ -35,7 +35,7 @@ x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 T_in           = 9.9 + 273.15
-valve_position = 0.02
+valve_position = 0.0
 
 def u_fn(t):
     return np.array([valve_position])
