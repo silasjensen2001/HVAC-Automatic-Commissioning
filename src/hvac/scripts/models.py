@@ -7,82 +7,95 @@ from scipy.optimize import root
 
 # - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
 class HVAC:
-    def __init__(self, components: list):
+    def __init__(self, configs: list, mode: str = "linear"):
         """
         Args:
-            components: Ordered list of LinearHeatExchanger (or compatible) instances.
-                        Air flows through them in series: components[0] → components[1] → ...
+            configs: Ordered list of parameter dicts for each heat exchanger.
+                     Air flows through them in series: configs[0] → configs[1] → ...
+            mode:    "linear"    — simulate with linearised state-space matrices.
+                     "nonlinear" — simulate with full nonlinear ODEs.
+                     The linear model (A, B_u, B_d, C, coordinate_shift) is always
+                     built so it is available for controller design and .mat export.
         """
-  
-        self.components = components
-        self.total_states = sum(c.num_states for c in components)
+        if mode not in ("linear", "nonlinear"):
+            raise ValueError(f"mode must be 'linear' or 'nonlinear', got {mode!r}")
 
-        self.coordinate_shift = np.zeros((self.total_states,)) 
+        self.configs = configs
+        self.mode    = mode
 
+        # Linear models. Always constructed as they are needed for LMI design and .mat export)
+        self._lin_components  = [LinearHeatExchanger(**cfg) for cfg in configs]
+        self.total_states     = sum(c.num_states for c in self._lin_components)
+        self.coordinate_shift = np.zeros(self.total_states)
         self.A, self.B_u, self.B_d, self.C = self._assemble_system()
+        self._check_controllability(self.A, self.B_u)
+
+        # Nonlinear components — only built when needed
+        if mode == "nonlinear":
+            self._nl_components = [NonlinearHeatExchanger(**cfg) for cfg in configs]
 
     def _export_state_space(self, file_path: str):
         sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "B_d": self.B_d, "x_shift": self.coordinate_shift, "C": self.C})
 
     def _assemble_system(self):
         """
-        Assemble full block state-space from component instances.
+        Assemble full block state-space from linear component instances.
         Each component must expose: A, B_u, B_d, C, Offset
         """
-        
-        A = np.zeros((self.total_states, self.total_states))
-        B_u = np.zeros((self.total_states, len(self.components))) # Single input per component 
-        B_d = np.zeros((self.total_states, 1))
-        C = np.zeros((len(self.components), self.total_states))
+        A      = np.zeros((self.total_states, self.total_states))
+        B_u    = np.zeros((self.total_states, len(self._lin_components)))
+        B_d    = np.zeros((self.total_states, 1))
+        C      = np.zeros((len(self._lin_components), self.total_states))
         Offset = np.zeros((self.total_states, 1))
 
-        # Local offset and last output for coupling between components
-        offset = 0
-        prev_C = None
+        offset   = 0
+        prev_C   = None
         prev_offset = None
-        prev_n = None
+        prev_n   = None
 
-        for comp_idx, component in enumerate(self.components):
+        for comp_idx, component in enumerate(self._lin_components):
             n = component.num_states
-            
-            # Block diagonal self-dynamics
-            A[offset:offset+n, offset:offset+n] = component.A
-            
-            # Series air coupling from previous component
-            if prev_C is not None:
-                coupling = component.B_d @ prev_C  # (n x n_prev)
-                A[offset:offset+n, prev_offset:prev_offset+prev_n] = coupling
-            
-            # Input matrix
-            B_u[offset:offset+n, comp_idx:comp_idx+1] += component.B_u
-            
-            # Disturbance matrix
-            if offset == 0:
-                B_d[offset:offset+n, :] += component.B_d  # only used for first component
-            
-            # Output matrix
-            C[comp_idx, offset:offset+n] = component.C[0, :]
 
-            # Offset
-            Offset[offset:offset+n, :] += component.Offset
-            
-            prev_C = component.C
+            A[offset:offset+n, offset:offset+n] = component.A
+
+            if prev_C is not None:
+                coupling = component.B_d @ prev_C
+                A[offset:offset+n, prev_offset:prev_offset+prev_n] = coupling
+
+            B_u[offset:offset+n, comp_idx:comp_idx+1] += component.B_u
+
+            if offset == 0:
+                B_d[offset:offset+n, :] += component.B_d
+
+            C[comp_idx, offset:offset+n] = component.C[0, :]
+            Offset[offset:offset+n, :]   += component.Offset
+
+            prev_C      = component.C
             prev_offset = offset
-            prev_n = n
-            offset += n
+            prev_n      = n
+            offset      += n
 
         self._compute_frame_shift(A, Offset)
-
         return A, B_u, B_d, C
 
     def _check_stability_and_rank(self, A: np.ndarray):
-        # Check if all eigenvalues of A have negative real part
         eigenvalues = np.linalg.eigvals(A)
         if np.any(eigenvalues.real >= 0):
             raise ValueError("System is not stable. Eigenvalues:\n", eigenvalues)
-        # Check if A is full rank
         if np.linalg.matrix_rank(A) < A.shape[0]:
             raise ValueError("System matrix A is not full rank. Rank:", np.linalg.matrix_rank(A))
+
+    def _check_controllability(self, A: np.ndarray, B_u: np.ndarray):
+        # PBH test: rank([λI - A, B]) = n for every eigenvalue λ of A.
+        # Numerically stable for stiff systems unlike the matrix-power method.
+        n = A.shape[0]
+        uncontrollable_modes = []
+        for lam in np.linalg.eigvals(A):
+            pbh = np.hstack([lam * np.eye(n) - A, B_u])
+            if np.linalg.matrix_rank(pbh) < n:
+                uncontrollable_modes.append(lam)
+        if uncontrollable_modes:
+            raise ValueError(f"System is not controllable. {len(uncontrollable_modes)} uncontrollable mode(s): {uncontrollable_modes}")
 
     def _compute_frame_shift(self, A: np.ndarray, Offset: np.ndarray):
         self._check_stability_and_rank(A)
@@ -94,9 +107,26 @@ class HVAC:
     def _to_shifted_frame(self, x: np.ndarray) -> np.ndarray:
         return x - self.coordinate_shift
 
+    def _nonlinear_derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
+        T_air_in = d[0]
+        offset   = 0
+        parts    = []
+        for i, comp in enumerate(self._nl_components):
+            n    = comp.num_states
+            x_k  = x[offset:offset+n]
+            dxdt = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in]))
+            parts.append(dxdt)
+            T_air_in = np.mean(x_k[:comp.K])   # outlet air → next component's inlet
+            offset  += n
+        return np.concatenate(parts)
+    
     def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
-        z = self._to_shifted_frame(x)
-        return self.A @ z + self.B_u @ u + self.B_d @ d
+        if self.mode == "linear":
+            z = self._to_shifted_frame(x)
+            return self.A @ z + self.B_u @ u + self.B_d @ d
+        else:
+            return self._nonlinear_derivatives(x, u, d)
+
 
 # - - - - - - - - - - - - - - - - Heat Exchanger - - - - - - - - - - - - - - - -
 class BaseHeatExchanger(ABC):
@@ -489,7 +519,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         mass_flow_vapor = omega * self.mass_flow_dry_air
   
         # Numerator terms
-        newtons_cooling_term = (self.gamma/self.delta_x) * (T_out - theta)
+        newtons_cooling_term = self.Newton_coeff * (T_out - theta)
         advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
         advective_term_vapor = mass_flow_vapor * self.c_pv * (T_in - T_out)
 

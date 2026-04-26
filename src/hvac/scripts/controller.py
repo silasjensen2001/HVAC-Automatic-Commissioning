@@ -66,7 +66,7 @@ class StateFeedbackController:
             dx_I: Integrator derivative, shape (n_outputs,).
         """
         error = r - self.outputs(x)
-        error[0] = -error[0]  # Invert error for cooler outlet temperature (we want it to be below the setpoint)
+        #error[0] = -error[0]  # Invert error for cooler outlet temperature (we want it to be below the setpoint)
         u_raw = self._raw_input(x, x_I)
 
         anti_windup = np.ones(self.n_outputs)

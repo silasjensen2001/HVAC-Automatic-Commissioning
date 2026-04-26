@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
-from models import LinearHeatExchanger, HVAC
+from models import HVAC
 from controller import StateFeedbackController
 
 
@@ -35,10 +35,10 @@ params_heater = dict(
     Kvs                   = 1.6471,
 )
 
+model_mode = "nonlinear"  # "linear" or "nonlinear"
+
 # ── Instantiate plant ─────────────────────────────────────────────────────────
-lin_cooler = LinearHeatExchanger(**params_cooler)
-lin_heater = LinearHeatExchanger(**params_heater)
-hvac       = HVAC(components=[lin_cooler, lin_heater])
+hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -54,7 +54,7 @@ controller = StateFeedbackController.from_mat_files(
 )
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
-K = lin_cooler.K
+K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ x0 = np.concatenate([
 ])
 
 # ── References and disturbances ───────────────────────────────────────────────
-T1_ref = 15.0 + 273.15   # Cooler air outlet setpoint [K]
+T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
 T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
 
@@ -148,21 +148,6 @@ axes[1, 1].set_ylabel("Temperature [°C]")
 axes[1, 1].legend(fontsize=8)
 axes[1, 1].grid(True, alpha=0.35)
 
-"""
-axes[2, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
-axes[2, 0].set_title("Valve Opening — Cooler")
-axes[2, 0].set_ylabel("Opening [-]")
-axes[2, 0].set_ylim(-0.05, 1.05)
-axes[2, 0].set_xlabel("Time [s]")
-axes[2, 0].grid(True, alpha=0.35)
-
-axes[2, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
-axes[2, 1].set_title("Valve Opening — Heater")
-axes[2, 1].set_ylabel("Opening [-]")
-axes[2, 1].set_ylim(-0.05, 1.05)
-axes[2, 1].set_xlabel("Time [s]")
-axes[2, 1].grid(True, alpha=0.35)
-"""
 axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
 axes[2, 0].set_title("Integrator State — Cooler")
 axes[2, 0].set_ylabel("x_I [K·s]")
@@ -190,6 +175,7 @@ for col, label in enumerate(["Cooler", "Heater"]):
     axes[4, col].set_xlabel("Time [s]")
     axes[4, col].grid(True, alpha=0.35)
 
+"""
 # Row 5 — Raw error
 axes[5, 0].plot(sol.t, e_cooler, color="crimson", linewidth=2)
 axes[5, 0].axhline(0, color="black", linestyle="--", linewidth=0.8)
@@ -204,8 +190,25 @@ axes[5, 1].set_title("Error — Heater")
 axes[5, 1].set_ylabel("e [°C]")
 axes[5, 1].set_xlabel("Time [s]")
 axes[5, 1].grid(True, alpha=0.35)
+"""
 
-plt.suptitle("HVAC cascade (Linear): Cooler → Heater", fontsize=13)
+
+axes[5, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
+axes[5, 0].set_title("Valve Opening — Cooler")
+axes[5, 0].set_ylabel("Opening [-]")
+axes[5, 0].set_ylim(-0.05, 1.05)
+axes[5, 0].set_xlabel("Time [s]")
+axes[5, 0].grid(True, alpha=0.35)
+
+axes[5, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
+axes[5, 1].set_title("Valve Opening — Heater")
+axes[5, 1].set_ylabel("Opening [-]")
+axes[5, 1].set_ylim(-0.05, 1.05)
+axes[5, 1].set_xlabel("Time [s]")
+axes[5, 1].grid(True, alpha=0.35)
+
+
+plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater", fontsize=13)
 plt.tight_layout()
 plt.show()
 

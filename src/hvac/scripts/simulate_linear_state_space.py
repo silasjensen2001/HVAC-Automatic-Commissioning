@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
-from models import LinearHeatExchanger, HVAC
+from models import HVAC
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -34,11 +34,8 @@ params_heater = dict(
     Kvs                   = 1.6471,
 )
 
-# ── Instantiate components and HVAC ──────────────────────────────────────────
-lin_cooler = LinearHeatExchanger(**params_cooler)
-lin_heater = LinearHeatExchanger(**params_heater)
-
-hvac = HVAC(components=[lin_cooler, lin_heater])
+# ── Instantiate HVAC ─────────────────────────────────────────────────────────
+hvac = HVAC(configs=[params_cooler, params_heater], mode="nonlinear")
 
 # export model
 
@@ -49,7 +46,7 @@ data_path = data_dir / f"{type_label}_model.mat"
 
 hvac._export_state_space(data_path)
 
-K = lin_cooler.K
+K = hvac._lin_components[0].K
 N = hvac.total_states  # 2 * 2K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
@@ -66,7 +63,7 @@ x0 = np.concatenate([
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 T_in          = 28 + 273.15   # Air inlet to cooler [K]
-valve_cooler  = 0.95
+valve_cooler  = 0.02
 valve_heater  = 0.02
 
 def u(t):
