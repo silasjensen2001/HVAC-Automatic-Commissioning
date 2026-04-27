@@ -7,8 +7,9 @@ from controller import StateFeedbackController
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
-params_cooler = dict(
-    type                  = "cooler",
+
+params_heater_1 = dict(
+    type                  = "heater",
     num_segments          = 5,
     num_pipes             = 10,
     gamma                 = 951.87,
@@ -17,11 +18,11 @@ params_cooler = dict(
     heat_exchanger_width  = 0.5,
     heat_exchanger_height = 0.5,
     volume_flow_wet_air   = 0.72634,
-    water_supply_T        = 8.0 + 273.15,
+    water_supply_T        = 66.9 + 273.15,
     Kvs                   = 1.6471,
 )
 
-params_heater = dict(
+params_heater_2 = dict(
     type                  = "heater",
     num_segments          = 5,
     num_pipes             = 10,
@@ -38,7 +39,7 @@ params_heater = dict(
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
-hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode)
+hvac = HVAC(configs=[params_heater_1, params_heater_2], mode=model_mode)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -49,8 +50,8 @@ hvac._export_state_space(data_dir / "HVAC_model.mat")
 controller_dir = Path(__file__).resolve().parent.parent / "models/controller"
 controller = StateFeedbackController.from_mat_files(
     plant    = hvac,
-    K_x_path = controller_dir / "K_x.mat",
-    K_I_path = controller_dir / "K_I.mat",
+    K_x_path = controller_dir / "K_x_case_3.mat",
+    K_I_path = controller_dir / "K_I_case_3.mat",
 )
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
@@ -58,23 +59,23 @@ K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
-t_end  = 300
+t_end  = 50
 t_eval = np.linspace(0, t_end, 2000)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
 x0 = np.concatenate([
-    np.full(K, 28 + 273.15),          # cooler air
-    np.full(K, 28 + 273.15),          # cooler water
-    np.full(K, 9.9 + 273.15),     # heater air
-    np.full(K, 9.9 + 273.15),         # heater water
+    np.full(K, 10 + 273.15),          # cooler air
+    np.full(K, 10 + 273.15),          # cooler water
+    np.full(K, 15.0 + 273.15),     # heater air
+    np.full(K, 15.0 + 273.15),         # heater water
 ])
 
 # ── References and disturbances ───────────────────────────────────────────────
-T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
+T1_ref = 15.0 + 273.15   # Cooler air outlet setpoint [K]
 T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
 
-T_in = 28 + 273.15        # Air inlet to cooler [K]
+T_in = 10 + 273.15        # Air inlet to cooler [K]
 
 def d(t):
     return np.array([T_in])
@@ -124,51 +125,51 @@ fig, axes = plt.subplots(6, 2, figsize=(14, 24), sharex=True)
 axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
 axes[0, 0].axhline(T_in - 273.15,    color="black", linestyle=":",  label=f"Inlet ({T_in-273.15:.1f} °C)")
 axes[0, 0].axhline(T1_ref - 273.15,  color="green", linestyle="--", label=f"Ref ({T1_ref-273.15:.1f} °C)")
-axes[0, 0].set_title("Cooler — Air Temperature")
+axes[0, 0].set_title("Heater 1 — Air Temperature")
 axes[0, 0].set_ylabel("Temperature [°C]")
 axes[0, 0].legend(fontsize=8)
 axes[0, 0].grid(True, alpha=0.35)
 
 axes[1, 0].plot(sol.t, T_water_cooler[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 0].set_title("Cooler — Water Temperature")
+axes[1, 0].set_title("Heater 1 — Water Temperature")
 axes[1, 0].set_ylabel("Temperature [°C]")
 axes[1, 0].legend(fontsize=8)
 axes[1, 0].grid(True, alpha=0.35)
 
 axes[0, 1].plot(sol.t, T_air_heater.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
 axes[0, 1].axhline(T2_ref - 273.15, color="green", linestyle="--", label=f"Ref ({T2_ref-273.15:.1f} °C)")
-axes[0, 1].set_title("Heater — Air Temperature")
+axes[0, 1].set_title("Heater 2 — Air Temperature")
 axes[0, 1].set_ylabel("Temperature [°C]")
 axes[0, 1].legend(fontsize=8)
 axes[0, 1].grid(True, alpha=0.35)
 
 axes[1, 1].plot(sol.t, T_water_heater[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 1].set_title("Heater — Water Temperature")
+axes[1, 1].set_title("Heater 2 — Water Temperature")
 axes[1, 1].set_ylabel("Temperature [°C]")
 axes[1, 1].legend(fontsize=8)
 axes[1, 1].grid(True, alpha=0.35)
 
 axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
-axes[2, 0].set_title("Integrator State — Cooler")
+axes[2, 0].set_title("Integrator State — Heater 1")
 axes[2, 0].set_ylabel("x_I [K·s]")
 axes[2, 0].set_xlabel("Time [s]")
 axes[2, 0].grid(True, alpha=0.35)
 
 axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
-axes[2, 1].set_title("Integrator State — Heater")
+axes[2, 1].set_title("Integrator State — Heater 2")
 axes[2, 1].set_ylabel("x_I [K·s]")
 axes[2, 1].set_xlabel("Time [s]")
 axes[2, 1].grid(True, alpha=0.35)
 
 # Row 3 — Kx·x contribution
-for col, label in enumerate(["Cooler", "Heater"]):
+for col, label in enumerate(["Heater 1", "Heater 2"]):
     axes[3, col].plot(sol.t, Kx_x_hist[col], color="teal", linewidth=2)
     axes[3, col].set_title(f"Kx·x — {label}")
     axes[3, col].set_ylabel("Kx·x [valve units]")
     axes[3, col].grid(True, alpha=0.35)
 
 # Row 4 — KI·xI contribution
-for col, label in enumerate(["Cooler", "Heater"]):
+for col, label in enumerate(["Heater 1", "Heater 2"]):
     axes[4, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=2)
     axes[4, col].set_title(f"KI·xI — {label}")
     axes[4, col].set_ylabel("KI·xI [valve units]")
@@ -194,21 +195,21 @@ axes[5, 1].grid(True, alpha=0.35)
 
 
 axes[5, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
-axes[5, 0].set_title("Valve Opening — Cooler")
+axes[5, 0].set_title("Valve Opening — Heater 1")
 axes[5, 0].set_ylabel("Opening [-]")
 axes[5, 0].set_ylim(-0.05, 1.05)
 axes[5, 0].set_xlabel("Time [s]")
 axes[5, 0].grid(True, alpha=0.35)
 
 axes[5, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
-axes[5, 1].set_title("Valve Opening — Heater")
+axes[5, 1].set_title("Valve Opening — Heater 2")
 axes[5, 1].set_ylabel("Opening [-]")
 axes[5, 1].set_ylim(-0.05, 1.05)
 axes[5, 1].set_xlabel("Time [s]")
 axes[5, 1].grid(True, alpha=0.35)
 
 
-plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater", fontsize=13)
+#plt.suptitle(f"HVAC cascade ({model_mode}): Heater 1 → Heater 2", fontsize=13)
 plt.tight_layout()
 plt.show()
 

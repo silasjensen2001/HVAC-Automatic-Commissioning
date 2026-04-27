@@ -484,6 +484,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         # Cooler specific assumptions 
         relative_humidity = 1
         L = 2500.9 * 1000 # [J/kg]
+        T_ref = 273.15 # [K]
                 
         # omega
         omega_in = self._omega(T_in, self.relative_humidity_in_system)
@@ -497,14 +498,14 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         # Numerator terms
         newtons_cooling_term = self.Newton_coeff * (T_out - theta)
         advective_term_dry_air = self.mass_flow_dry_air * self.c_pa * (T_in - T_out)
-        heat_vapor_in = mass_flow_vapor_in * (self.c_pv * T_in + L)
-        heat_vapor_out = mass_flow_vapor_out * (self.c_pv * T_out + L)
-        heat_condensate = (mass_flow_vapor_in - mass_flow_vapor_out) * self.c_pc * T_out
+        heat_vapor_in = mass_flow_vapor_in * (self.c_pv * (T_in - T_ref) + L)
+        heat_vapor_out = mass_flow_vapor_out * (self.c_pv * (T_out - T_ref) + L)
+        heat_condensate = (mass_flow_vapor_in - mass_flow_vapor_out) * self.c_pc * (T_out - T_ref)
         
         numerator = -newtons_cooling_term + advective_term_dry_air + heat_vapor_in - heat_vapor_out - heat_condensate
         
         # Denominator terms
-        denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * T_out + L) * domega_dT_out - domega_dT_out * self.c_pc * T_out)
+        denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * (T_out - T_ref) + L) * domega_dT_out - domega_dT_out * self.c_pc * (T_out - T_ref))
 
         return numerator / denominator
 

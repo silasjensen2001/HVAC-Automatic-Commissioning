@@ -35,7 +35,7 @@ x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 T_in           = 28 + 273.15
-valve_position = 0.0
+valve_position = 0.05
 
 def u_fn(t):
     return np.array([valve_position])
@@ -44,7 +44,7 @@ def d_fn(t):
     return np.array([T_in])
 
 # ── Integrate both ────────────────────────────────────────────────────────────
-t_end  = 3000
+t_end  = 2000
 t_eval = np.linspace(0, t_end, 10000)
 
 sol_lin = solve_ivp(
