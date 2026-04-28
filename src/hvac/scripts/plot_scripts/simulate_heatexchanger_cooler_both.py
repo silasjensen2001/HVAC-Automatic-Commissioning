@@ -44,8 +44,8 @@ def d_fn(t):
     return np.array([T_in])
 
 # ── Integrate both ────────────────────────────────────────────────────────────
-t_end  = 2000
-t_eval = np.linspace(0, t_end, 10000)
+t_end  = 100
+t_eval = np.linspace(0, t_end, 1000)
 
 sol_lin = solve_ivp(
     lambda t, x: linear_model.derivatives(x, u_fn(t), d_fn(t)),

@@ -38,7 +38,7 @@ params_heater = dict(
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
-hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode)
+hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, disturbance=28 + 273.15)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -51,6 +51,7 @@ controller = StateFeedbackController.from_mat_files(
     plant    = hvac,
     K_x_path = controller_dir / "K_x.mat",
     K_I_path = controller_dir / "K_I.mat",
+    N_path   = controller_dir / "N.mat",
 )
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
@@ -94,24 +95,23 @@ T_air_heater   = sol.y[2*K:3*K] - 273.15
 T_water_heater = sol.y[3*K:4*K] - 273.15
 x_I_hist       = sol.y[N:]      # shape (n_outputs, n_timesteps)
 
-u_hist = np.array([
-    controller.compute_input(sol.y[:N, i], sol.y[N:, i])
-    for i in range(sol.y.shape[1])
-]).T   # shape (n_inputs, n_timesteps)
-
-mid = K // 2
-
 # ── Decompose control contributions ──────────────────────────────────────────
-Kx_x_hist = np.array([
-    controller.K_x @ sol.y[:N, i]
+u_hist = np.array([
+    controller.compute_input(sol.y[:N, i], sol.y[N:, i], r)   # add r
     for i in range(sol.y.shape[1])
-]).T   # shape (n_inputs, n_timesteps)
+]).T
+
+Kx_x_hist = np.array([
+    controller.K_x @ controller.plant._to_shifted_frame(sol.y[:N, i])  # use shifted frame
+    for i in range(sol.y.shape[1])
+]).T# shape (n_inputs, n_timesteps)
 
 KI_xI_hist = np.array([
     controller.K_I @ sol.y[N:, i]
     for i in range(sol.y.shape[1])
 ]).T   # shape (n_inputs, n_timesteps)
 
+mid = K // 2
 # ── Output error (non-integrated) ────────────────────────────────────────────
 y_cooler = sol.y[K-1]    - 273.15   # cooler air outlet (last segment)
 y_heater = sol.y[3*K-1]  - 273.15   # heater air outlet (last segment)

@@ -7,7 +7,7 @@ from scipy.optimize import root
 
 # - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
 class HVAC:
-    def __init__(self, configs: list, mode: str = "linear"):
+    def __init__(self, configs: list, mode: str = "linear", disturbance: float = 0.0):
         """
         Args:
             configs: Ordered list of parameter dicts for each heat exchanger.
@@ -22,12 +22,13 @@ class HVAC:
 
         self.configs = configs
         self.mode    = mode
+        self.disturbance = disturbance
 
         # Linear models. Always constructed as they are needed for LMI design and .mat export)
         self._lin_components  = [LinearHeatExchanger(**cfg) for cfg in configs]
         self.total_states     = sum(c.num_states for c in self._lin_components)
         self.coordinate_shift = np.zeros(self.total_states)
-        self.A, self.B_u, self.B_d, self.C = self._assemble_system()
+        self.A, self.B_u, self.C = self._assemble_system()
         self._check_controllability(self.A, self.B_u)
 
         # Nonlinear components — only built when needed
@@ -35,7 +36,7 @@ class HVAC:
             self._nl_components = [NonlinearHeatExchanger(**cfg) for cfg in configs]
 
     def _export_state_space(self, file_path: str):
-        sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "B_d": self.B_d, "x_shift": self.coordinate_shift, "C": self.C})
+        sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "x_shift": self.coordinate_shift, "C": self.C})
 
     def _assemble_system(self):
         """
@@ -75,8 +76,10 @@ class HVAC:
             prev_n      = n
             offset      += n
 
+        Offset += B_d * self.disturbance
+
         self._compute_frame_shift(A, Offset)
-        return A, B_u, B_d, C
+        return A, B_u, C
 
     def _check_stability_and_rank(self, A: np.ndarray):
         eigenvalues = np.linalg.eigvals(A)
@@ -123,7 +126,7 @@ class HVAC:
     def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         if self.mode == "linear":
             z = self._to_shifted_frame(x)
-            return self.A @ z + self.B_u @ u + self.B_d @ d
+            return self.A @ z + self.B_u @ u
         else:
             return self._nonlinear_derivatives(x, u, d)
 

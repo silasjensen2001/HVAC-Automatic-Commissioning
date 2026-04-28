@@ -39,7 +39,8 @@ params_heater_2 = dict(
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
-hvac = HVAC(configs=[params_heater_1, params_heater_2], mode=model_mode)
+T_in = 10 + 273.15        # Air inlet to cooler [K] / constant disturbance to heater
+hvac = HVAC(configs=[params_heater_1, params_heater_2], mode=model_mode, disturbance=T_in)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -50,8 +51,9 @@ hvac._export_state_space(data_dir / "HVAC_model.mat")
 controller_dir = Path(__file__).resolve().parent.parent / "models/controller"
 controller = StateFeedbackController.from_mat_files(
     plant    = hvac,
-    K_x_path = controller_dir / "K_x_case_3.mat",
-    K_I_path = controller_dir / "K_I_case_3.mat",
+    K_x_path = controller_dir / "K_x.mat",
+    K_I_path = controller_dir / "K_I.mat",
+    N_path   = controller_dir / "N.mat",
 )
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
@@ -71,11 +73,11 @@ x0 = np.concatenate([
 ])
 
 # ── References and disturbances ───────────────────────────────────────────────
-T1_ref = 15.0 + 273.15   # Cooler air outlet setpoint [K]
-T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
+T1_ref = 20.0 + 273.15   # Cooler air outlet setpoint [K]
+T2_ref = 30.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
 
-T_in = 10 + 273.15        # Air inlet to cooler [K]
+
 
 def d(t):
     return np.array([T_in])
@@ -95,29 +97,62 @@ T_air_heater   = sol.y[2*K:3*K] - 273.15
 T_water_heater = sol.y[3*K:4*K] - 273.15
 x_I_hist       = sol.y[N:]      # shape (n_outputs, n_timesteps)
 
-u_hist = np.array([
-    controller.compute_input(sol.y[:N, i], sol.y[N:, i])
-    for i in range(sol.y.shape[1])
-]).T   # shape (n_inputs, n_timesteps)
-
-mid = K // 2
-
 # ── Decompose control contributions ──────────────────────────────────────────
-Kx_x_hist = np.array([
-    controller.K_x @ sol.y[:N, i]
+u_hist = np.array([
+    controller.compute_input(sol.y[:N, i], sol.y[N:, i], r)   # add r
     for i in range(sol.y.shape[1])
-]).T   # shape (n_inputs, n_timesteps)
+]).T
+
+Kx_x_hist = np.array([
+    controller.K_x @ controller.plant._to_shifted_frame(sol.y[:N, i])  # use shifted frame
+    for i in range(sol.y.shape[1])
+]).T# shape (n_inputs, n_timesteps)
 
 KI_xI_hist = np.array([
     controller.K_I @ sol.y[N:, i]
     for i in range(sol.y.shape[1])
 ]).T   # shape (n_inputs, n_timesteps)
 
+mid = K // 2
+
 # ── Output error (non-integrated) ────────────────────────────────────────────
 y_cooler = sol.y[K-1]    - 273.15   # cooler air outlet (last segment)
 y_heater = sol.y[3*K-1]  - 273.15   # heater air outlet (last segment)
 e_cooler = (T1_ref - 273.15) - y_cooler
 e_heater = (T2_ref - 273.15) - y_heater
+
+# ── Debug: decompose u at key timesteps ───────────────────────────────────────
+print("\n=== Control law decomposition ===")
+print(f"  u = u_op + Kx·z + KI·xI + N·r_dev")
+print(f"  {'t':>6} {'r_shift':>10} {'Kx·z':>10} {'KI·xI':>10} {'N·r':>10} {'u_raw':>10} {'u_sat':>8}")
+
+for i in [0, 10, 50, 200, 500, -1]:
+    t_i   = sol.t[i]
+    x_i   = sol.y[:N, i]
+    xI_i  = sol.y[N:, i]
+    z_i   = controller.plant._to_shifted_frame(x_i)
+    r_dev = r - controller.plant.C @ controller.plant.coordinate_shift
+
+    r_shift = r - controller.plant.C @ controller.plant.coordinate_shift
+    Kx_term    = controller.K_x @ z_i
+    KI_term    = controller.K_I @ xI_i
+    N_term     = controller.N  @ r_dev
+    u_raw      = Kx_term + KI_term + N_term
+    u_sat      = np.clip(u_raw, 0, 1)
+
+    for ch in range(2):
+        label = f"t={t_i:.1f} ch{ch+1}"
+        print(f"  {label:>10} r_shift={r_shift[ch]:+.4f} Kx·z={Kx_term[ch]:+.4f}  "
+              f"KI·xI={KI_term[ch]:+.4f}  N·r={N_term[ch]:+.4f}  "
+              f"u_raw={u_raw[ch]:+.4f}  u_sat={u_sat[ch]:.4f}")
+    print()
+
+# ── Debug: print operating point info ─────────────────────────────────────────
+print("=== Operating point ===")
+print(f"  coordinate_shift (x_op): {controller.plant.coordinate_shift}")
+print(f"  C @ x_op (y_op):         {controller.plant.C @ controller.plant.coordinate_shift - 273.15} °C")
+print(f"  r_dev = r - y_op:        {r - controller.plant.C @ controller.plant.coordinate_shift} K")
+print(f"  N matrix:\n{controller.N}")
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(6, 2, figsize=(14, 24), sharex=True)
