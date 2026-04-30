@@ -48,36 +48,29 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Instantiate controller ────────────────────────────────────────────────────
-controller_dir = Path(__file__).resolve().parent.parent / "models/controller"
-controller = StateFeedbackController.from_mat_files(
-    plant    = hvac,
-    K_x_path = controller_dir / "K_x.mat",
-    K_I_path = controller_dir / "K_I.mat",
-    N_path   = controller_dir / "N.mat",
-)
+Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=10, R_scale=1)
+controller = StateFeedbackController.find_controller_gains(hvac, Q=Q, R=R)
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
-t_end  = 50
+t_end  = 15
 t_eval = np.linspace(0, t_end, 2000)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
 x0 = np.concatenate([
-    np.full(K, 10 + 273.15),          # cooler air
-    np.full(K, 10 + 273.15),          # cooler water
+    np.full(K, 5.0 + 273.15),          # cooler air
+    np.full(K, 5.0 + 273.15),          # cooler water
     np.full(K, 15.0 + 273.15),     # heater air
     np.full(K, 15.0 + 273.15),         # heater water
 ])
 
 # ── References and disturbances ───────────────────────────────────────────────
-T1_ref = 20.0 + 273.15   # Cooler air outlet setpoint [K]
-T2_ref = 30.0 + 273.15   # Heater air outlet setpoint [K]
+T1_ref = 15.0 + 273.15   # Cooler air outlet setpoint [K]
+T2_ref = 35.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
-
-
 
 def d(t):
     return np.array([T_in])
