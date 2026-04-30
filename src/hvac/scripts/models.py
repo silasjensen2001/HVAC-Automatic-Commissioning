@@ -257,12 +257,12 @@ class LinearHeatExchanger(BaseHeatExchanger):
         super().__init__(**kwargs)
         self._kwargs = kwargs  # store so we can spin up NonlinearHeatExchanger internally
 
+        self.theta_return_operation_point = None # will be set to return water temp at equilibrium in _construct_air_state_block()
+
         if self.type == "heater":
             self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
-            self.theta_return_operation_point = 26.611 + 273.15 # [K] return water temperature at operation point
         else:
             self.valve_operation_point = 0.95 # [0-1] valve opening for water flow
-            self.theta_return_operation_point = 5.56611657 + 273.15 # [K] return water temperature at operation point
         
         # Central difference parameters for linearization of air dynamics
         self.eps = 1e-5
@@ -364,6 +364,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
         x_eq      = self._find_equilibrium(nonlinear, u_op, d_op)
         T_eq     = x_eq[:self.K]   # air temperatures at equilibrium, one per segment
         theta_eq = x_eq[self.K:]   # water temperatures at equilibrium, one per segment
+        self.theta_return_operation_point = theta_eq[-1] # set return water temp operation point to last segment's water temp at equilibrium
 
         seg_deriv = (nonlinear._air_cooler_segment_derivative if self.type == "cooler"
                      else nonlinear._air_heater_segment_derivative)

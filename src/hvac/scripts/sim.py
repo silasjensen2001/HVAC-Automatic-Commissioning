@@ -17,7 +17,7 @@ params_cooler = dict(
     heat_exchanger_width  = 0.5,
     heat_exchanger_height = 0.5,
     volume_flow_wet_air   = 0.72634,
-    water_supply_T        = 8.0 + 273.15,
+    water_supply_T        = 4.0 + 273.15,
     Kvs                   = 1.6471,
 )
 
@@ -54,7 +54,7 @@ K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
-t_end  = 300
+t_end  = 15
 t_eval = np.linspace(0, t_end, 2000)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
