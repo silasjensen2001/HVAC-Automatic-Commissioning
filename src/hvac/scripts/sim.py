@@ -46,7 +46,7 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Instantiate controller ────────────────────────────────────────────────────
-Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=10, R_scale=1)
+Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=1, R_scale=1)
 controller = StateFeedbackController.find_controller_gains(hvac, Q=Q, R=R)
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
