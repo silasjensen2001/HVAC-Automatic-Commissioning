@@ -38,7 +38,8 @@ params_heater = dict(
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
-hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, disturbance=28 + 273.15)
+#hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=28 + 273.15)
+hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=None)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -54,13 +55,16 @@ K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 # ── Time ──────────────────────────────────────────────────────────────────────
-t_end  = 15
-t_eval = np.linspace(0, t_end, 2000)
+t_day = 24*3600
+points_per_day = t_day * 3
+
+t_end  = t_day
+t_eval = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
 x0 = np.concatenate([
-    np.full(K, 28 + 273.15),          # cooler air
-    np.full(K, 28 + 273.15),          # cooler water
+    np.full(K, 23 + 273.15),          # cooler air
+    np.full(K, 23 + 273.15),          # cooler water
     np.full(K, 9.9 + 273.15),     # heater air
     np.full(K, 9.9 + 273.15),         # heater water
 ])
@@ -70,11 +74,13 @@ T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
 T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
 
-T_in = 28 + 273.15        # Air inlet to cooler [K]
+T_in = 23 + 273.15        # Air inlet to cooler [K]
 
 def d(t):
-    return np.array([T_in])
-
+    Amp = 5
+    T_day = 24*3600
+    T_in_sys = T_in + Amp * np.sin(2*np.pi*t/T_day)
+    return np.array([T_in_sys])
 # ── Simulate ──────────────────────────────────────────────────────────────────
 augmented_state0  = np.concatenate([x0, np.zeros(controller.n_outputs)])
 sol = solve_ivp(
@@ -84,6 +90,7 @@ sol = solve_ivp(
 )
 
 # ── Unpack solution ───────────────────────────────────────────────────────────
+T_inlet = np.array([d(t)[0] for t in sol.t]) - 273.15
 T_air_cooler   = sol.y[0:K]     - 273.15
 T_water_cooler = sol.y[K:2*K]   - 273.15
 T_air_heater   = sol.y[2*K:3*K] - 273.15
@@ -117,7 +124,7 @@ e_heater = (T2_ref - 273.15) - y_heater
 fig, axes = plt.subplots(6, 2, figsize=(14, 24), sharex=True)
 
 axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
-axes[0, 0].axhline(T_in - 273.15,    color="black", linestyle=":",  label=f"Inlet ({T_in-273.15:.1f} °C)")
+axes[0, 0].plot(sol.t, T_inlet, color="black", linewidth=1.5, linestyle=":", label="Inlet (actual)")
 axes[0, 0].axhline(T1_ref - 273.15,  color="green", linestyle="--", label=f"Ref ({T1_ref-273.15:.1f} °C)")
 axes[0, 0].set_title("Cooler — Air Temperature")
 axes[0, 0].set_ylabel("Temperature [°C]")

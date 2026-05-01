@@ -25,13 +25,13 @@ model = NonlinearHeatExchanger(
 K = model.K   # number of segments
 
 # ── Initial conditions ────────────────────────────────────────────────────────
-T_init     = np.full(K, 28.0 + 273.15)   # air   [K]
-theta_init = np.full(K, 28.0 + 273.15)   # water [K]
+T_init     = np.full(K, 23.0 + 273.15)   # air   [K]
+theta_init = np.full(K, 23.0 + 273.15)   # water [K]
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs: constant throughout ──────────────────────────────────────────────
-T_in           = 28.0 + 273.15   # [K]  warm humid air inlet
-valve_position = 0.95              # [0–1]  valve opening for water flow
+T_in           = 23.0 + 273.15   # [K]  warm humid air inlet
+valve_position = 0.353              # [0–1]  valve opening for water flow
 
 def u_fn(t):
     return np.array([valve_position])
@@ -40,7 +40,7 @@ def d_fn(t):
     return np.array([T_in])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 10
+t_end  = 200
 t_eval = np.linspace(0, t_end, 1000)
 
 def ode(t, x):

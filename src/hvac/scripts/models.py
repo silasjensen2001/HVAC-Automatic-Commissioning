@@ -7,7 +7,7 @@ from scipy.optimize import root
 
 # - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
 class HVAC:
-    def __init__(self, configs: list, mode: str = "linear", disturbance: float = 0.0):
+    def __init__(self, configs: list, mode: str = "linear", const_disturbance: float = None):
         """
         Args:
             configs: Ordered list of parameter dicts for each heat exchanger.
@@ -22,13 +22,18 @@ class HVAC:
 
         self.configs = configs
         self.mode    = mode
-        self.disturbance = disturbance
+        self.const_disturbance = const_disturbance
 
         # Linear models. Always constructed as they are needed for LMI design and .mat export)
         self._lin_components  = [LinearHeatExchanger(**cfg) for cfg in configs]
         self.total_states     = sum(c.num_states for c in self._lin_components)
         self.coordinate_shift = np.zeros(self.total_states)
-        self.A, self.B_u, self.C = self._assemble_system()
+
+        if self.const_disturbance is not None:
+            self.A, self.B_u, self.C = self._assemble_system()
+        else:
+            self.A, self.B_u, self.B_d, self.C = self._assemble_system()
+
         self._check_controllability(self.A, self.B_u)
 
         # Nonlinear components — only built when needed
@@ -76,10 +81,15 @@ class HVAC:
             prev_n      = n
             offset      += n
 
-        Offset += B_d * self.disturbance
+        if self.const_disturbance is not None:
+            Offset += B_d * self.const_disturbance
+            self._compute_frame_shift(A, Offset)
+            return A, B_u, C
+        else:
+            self._compute_frame_shift(A, Offset)
+            return A, B_u, B_d, C
 
-        self._compute_frame_shift(A, Offset)
-        return A, B_u, C
+  
 
     def _check_stability_and_rank(self, A: np.ndarray):
         eigenvalues = np.linalg.eigvals(A)
@@ -126,7 +136,12 @@ class HVAC:
     def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         if self.mode == "linear":
             z = self._to_shifted_frame(x)
-            return self.A @ z + self.B_u @ u
+
+            # If constant disturbance, fold it into the linear dynamics as an offset
+            if self.const_disturbance is not None:
+                return self.A @ z + self.B_u @ u
+            else:
+                return self.A @ z + self.B_u @ u + self.B_d @ d
         else:
             return self._nonlinear_derivatives(x, u, d)
 
@@ -180,7 +195,7 @@ class BaseHeatExchanger(ABC):
         self.cross_area_wet_air = (segment_depth * segment_height) - cross_area_water
         self.delta_x = segment_width
 
-        self.T_operational_in_cooler = 28 + 273.15 
+        self.T_operational_in_cooler = 23 + 273.15 # Was 28
         self.T_operational_in_heater = 9.9 + 273.15
         #self.relative_humidity_in_system = 0.5
         self.relative_humidity_in_system = 0.832
@@ -262,7 +277,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
         if self.type == "heater":
             self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
         else:
-            self.valve_operation_point = 0.95 # [0-1] valve opening for water flow
+            self.valve_operation_point = 0.353 # [0-1] valve opening for water flow 0.95 for 28°C inlet
         
         # Central difference parameters for linearization of air dynamics
         self.eps = 1e-5

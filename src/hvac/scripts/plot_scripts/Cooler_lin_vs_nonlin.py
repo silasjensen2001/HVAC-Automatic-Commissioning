@@ -29,13 +29,13 @@ nonlinear_model = NonlinearHeatExchanger(**params)
 K = linear_model.K
 
 # ── Initial conditions ────────────────────────────────────────────────────────
-T_init     = np.full(K, 28 + 273.15)
-theta_init = np.full(K, 28 + 273.15)
+T_init     = np.full(K, 23 + 273.15)
+theta_init = np.full(K, 23 + 273.15)
 x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
-T_in           = 28 + 273.15
-valve_position = 0.05
+T_in           = 23 + 273.15
+valve_position = 0.353
 
 def u_fn(t):
     return np.array([valve_position])
