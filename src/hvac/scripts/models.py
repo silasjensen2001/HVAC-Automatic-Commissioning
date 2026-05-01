@@ -41,7 +41,17 @@ class HVAC:
             self._nl_components = [NonlinearHeatExchanger(**cfg) for cfg in configs]
 
     def _export_state_space(self, file_path: str):
-        sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "x_shift": self.coordinate_shift, "C": self.C})
+        data = {
+            "A": self.A,
+            "B_u": self.B_u,
+            "x_shift": self.coordinate_shift,
+            "C": self.C,
+        }
+
+        if hasattr(self, "B_d"):
+            data["B_d"] = self.B_d
+
+        sio.savemat(file_path, data)
 
     def _assemble_system(self):
         """
