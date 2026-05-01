@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
 from models import HVAC
-from controller import StateFeedbackControllerDisturbanceRejection
+from controller import StateFeedbackControllerDisturbanceRejection, StateFeedbackController
 
 
 # ── Parameters ────────────────────────────────────────────────────────────────
@@ -47,8 +47,11 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Instantiate controller ────────────────────────────────────────────────────
-Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(hvac, Q_scale=1, R_scale=1)
+Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(hvac, Q_scale=5, R_scale=10)
 controller = StateFeedbackControllerDisturbanceRejection.find_controller_gains(hvac, Q=Q, R=R)
+
+#Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=5, R_scale=10)
+#controller = StateFeedbackController.find_controller_gains(hvac, Q=Q, R=R)
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
@@ -58,7 +61,7 @@ N = hvac.total_states   # 4K = 20
 t_day = 24*3600
 points_per_day = t_day * 3
 
-t_end  = 200 #t_day
+t_end  = 500 #t_day
 t_eval = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -99,7 +102,7 @@ x_I_hist       = sol.y[N:]      # shape (n_outputs, n_timesteps)
 
 # ── Decompose control contributions ──────────────────────────────────────────
 u_hist = np.array([
-    controller.compute_input(sol.y[:N, i], sol.y[N:, i], r)   # add r
+    controller.compute_input(sol.y[:N, i], sol.y[N:, i], r)[0]   # add r
     for i in range(sol.y.shape[1])
 ]).T
 
