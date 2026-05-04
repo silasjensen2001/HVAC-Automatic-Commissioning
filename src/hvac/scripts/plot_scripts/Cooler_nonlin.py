@@ -40,7 +40,7 @@ def d_fn(t):
     return np.array([T_in])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 30
+t_end  = 80
 t_eval = np.linspace(0, t_end, 1000)
 
 def ode(t, x):
