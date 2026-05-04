@@ -89,7 +89,7 @@ class StateFeedbackController:
        
         result = signal.place_poles(
             np.zeros((p, p)),   # A of integrator subsystem (square!)
-            -K_I.T,              # B: (p × m)  [note: K_I is (m×p), so K_I.T is (p×m)]
+            K_I.T,              # B: (p × m)  [note: K_I is (m×p), so K_I.T is (p×m)]
             desired_poles,            # p desired poles
         )
 
@@ -156,7 +156,7 @@ class StateFeedbackController:
         # Anti-windup correction
         anti_windup = self.M @ (u_sat - u_raw)
 
-        return error - anti_windup
+        return error + anti_windup
 
     def controller_derivatives(self, r: np.ndarray, d) -> callable:
         """
@@ -344,7 +344,7 @@ class StateFeedbackControllerDisturbanceRejection:
 
         result = signal.place_poles(
             np.zeros((p, p)),
-            -K_I.T,
+            K_I.T,
             desired_poles,
         )
 
@@ -377,7 +377,7 @@ class StateFeedbackControllerDisturbanceRejection:
         # Anti-windup correction
         anti_windup = self.M @ (u_valve_sat - u_valve)
 
-        return error - anti_windup
+        return error + anti_windup
 
     def controller_derivatives(self, r: np.ndarray, d) -> callable:
         N = self.plant.total_states
