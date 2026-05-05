@@ -47,12 +47,27 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Instantiate controller ────────────────────────────────────────────────────
-Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(hvac, Q_scale=5, R_scale=10)
-controller = StateFeedbackControllerDisturbanceRejection.find_controller_gains(hvac, Q=Q, R=R)
+USE_DISTURBANCE_REJECTION = False   # Toggle between LQR and H∞
+USE_BRYSON = False                  # Toggle between Bryson and uniform scaling
+    
+# ── Bryson bounds (physical / absolute frame) ─────────────────────────────────
+x_max   = np.full(20, 20 + 273.15)  # absolute temp ceiling per state [K] — converted to deviation inside cost_bryson
+u_max   = np.array([0.5, 0.5])      # max acceptable valve command [-]
+xI_max  = np.array([10.0, 10.0])    # max acceptable integrator state [K·s]
 
-#Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=5, R_scale=10)
-#controller = StateFeedbackController.find_controller_gains(hvac, Q=Q, R=R)
+# ── Cost matrices ─────────────────────────────────────────────────────────────
+ControllerCls = (
+    StateFeedbackControllerDisturbanceRejection if USE_DISTURBANCE_REJECTION
+    else StateFeedbackController
+)
 
+if USE_BRYSON:
+    Q, R = ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max)
+else:
+    Q, R = ControllerCls.cost_matrices(hvac, Q_scale=5.0, R_scale=800.0)
+
+# ── Build controller ──────────────────────────────────────────────────────────
+controller = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
@@ -61,7 +76,7 @@ N = hvac.total_states   # 4K = 20
 t_day = 24*3600
 points_per_day = t_day * 3
 
-t_end  = 500 #t_day
+t_end  = 30 #t_day
 t_eval = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -116,6 +131,11 @@ KI_xI_hist = np.array([
     for i in range(sol.y.shape[1])
 ]).T   # shape (n_inputs, n_timesteps)
 
+# Nr · r is constant (r is fixed), so broadcast across time
+r_shift = r - controller.plant.C @ controller.plant.coordinate_shift
+Nr_contribution = controller.N @ r_shift          # shape (n_inputs,)
+Nr_hist = Nr_contribution[:, np.newaxis] * np.ones((1, len(sol.t)))  # (n_inputs, n_timesteps)
+
 mid = K // 2
 # ── Output error (non-integrated) ────────────────────────────────────────────
 y_cooler = sol.y[K-1]    - 273.15   # cooler air outlet (last segment)
@@ -124,7 +144,7 @@ e_cooler = (T1_ref - 273.15) - y_cooler
 e_heater = (T2_ref - 273.15) - y_heater
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(6, 2, figsize=(14, 24), sharex=True)
+fig, axes = plt.subplots(5, 2, figsize=(14, 20), sharex=True)
 
 axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
 axes[0, 0].plot(sol.t, T_inlet, color="black", linewidth=1.5, linestyle=":", label="Inlet (actual)")
@@ -156,62 +176,39 @@ axes[1, 1].grid(True, alpha=0.35)
 axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
 axes[2, 0].set_title("Integrator State — Cooler")
 axes[2, 0].set_ylabel("x_I [K·s]")
-axes[2, 0].set_xlabel("Time [s]")
 axes[2, 0].grid(True, alpha=0.35)
 
 axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
 axes[2, 1].set_title("Integrator State — Heater")
 axes[2, 1].set_ylabel("x_I [K·s]")
-axes[2, 1].set_xlabel("Time [s]")
 axes[2, 1].grid(True, alpha=0.35)
 
-# Row 3 — Kx·x contribution
+# Row 3 — Control contributions + sum
 for col, label in enumerate(["Cooler", "Heater"]):
-    axes[3, col].plot(sol.t, Kx_x_hist[col], color="teal", linewidth=2)
-    axes[3, col].set_title(f"Kx·x — {label}")
-    axes[3, col].set_ylabel("Kx·x [valve units]")
+    combined = Kx_x_hist[col] + KI_xI_hist[col]
+    axes[3, col].plot(sol.t, Kx_x_hist[col],  color="teal",         linewidth=1.5, linestyle="--", label="Kx·x")
+    axes[3, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=1.5, linestyle="--", label="KI·xI")
+    axes[3, col].plot(sol.t, Nr_hist[col],     color="goldenrod",    linewidth=1.5, linestyle="--", label="Nr·r")
+    axes[3, col].plot(sol.t, combined,         color="black",        linewidth=2,                   label="Sum")
+    axes[3, col].set_title(f"Control contributions — {label}")
+    axes[3, col].set_ylabel("Valve units [-]")
+    axes[3, col].legend(fontsize=8)
     axes[3, col].grid(True, alpha=0.35)
 
-# Row 4 — KI·xI contribution
-for col, label in enumerate(["Cooler", "Heater"]):
-    axes[4, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=2)
-    axes[4, col].set_title(f"KI·xI — {label}")
-    axes[4, col].set_ylabel("KI·xI [valve units]")
-    axes[4, col].set_xlabel("Time [s]")
-    axes[4, col].grid(True, alpha=0.35)
+# Row 4 — Valve openings
+axes[4, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
+axes[4, 0].set_title("Valve Opening — Cooler")
+axes[4, 0].set_ylabel("Opening [-]")
+axes[4, 0].set_ylim(-0.05, 1.05)
+axes[4, 0].set_xlabel("Time [s]")
+axes[4, 0].grid(True, alpha=0.35)
 
-"""
-# Row 5 — Raw error
-axes[5, 0].plot(sol.t, e_cooler, color="crimson", linewidth=2)
-axes[5, 0].axhline(0, color="black", linestyle="--", linewidth=0.8)
-axes[5, 0].set_title("Error — Cooler")
-axes[5, 0].set_ylabel("e [°C]")
-axes[5, 0].set_xlabel("Time [s]")
-axes[5, 0].grid(True, alpha=0.35)
-
-axes[5, 1].plot(sol.t, e_heater, color="crimson", linewidth=2)
-axes[5, 1].axhline(0, color="black", linestyle="--", linewidth=0.8)
-axes[5, 1].set_title("Error — Heater")
-axes[5, 1].set_ylabel("e [°C]")
-axes[5, 1].set_xlabel("Time [s]")
-axes[5, 1].grid(True, alpha=0.35)
-"""
-
-
-axes[5, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
-axes[5, 0].set_title("Valve Opening — Cooler")
-axes[5, 0].set_ylabel("Opening [-]")
-axes[5, 0].set_ylim(-0.05, 1.05)
-axes[5, 0].set_xlabel("Time [s]")
-axes[5, 0].grid(True, alpha=0.35)
-
-axes[5, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
-axes[5, 1].set_title("Valve Opening — Heater")
-axes[5, 1].set_ylabel("Opening [-]")
-axes[5, 1].set_ylim(-0.05, 1.05)
-axes[5, 1].set_xlabel("Time [s]")
-axes[5, 1].grid(True, alpha=0.35)
-
+axes[4, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
+axes[4, 1].set_title("Valve Opening — Heater")
+axes[4, 1].set_ylabel("Opening [-]")
+axes[4, 1].set_ylim(-0.05, 1.05)
+axes[4, 1].set_xlabel("Time [s]")
+axes[4, 1].grid(True, alpha=0.35)
 
 plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater", fontsize=13)
 plt.tight_layout()

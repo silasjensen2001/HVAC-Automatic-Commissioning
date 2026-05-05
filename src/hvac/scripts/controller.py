@@ -34,11 +34,6 @@ class BaseStateFeedbackController(ABC):
     def outputs(self, x: np.ndarray) -> np.ndarray:
         return self.plant.C @ x
 
-    def raw_input(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
-        z       = self.plant._to_shifted_frame(x)
-        r_shift = r - self.plant.C @ self.plant.coordinate_shift
-        return self.K_x @ z + self.K_I @ x_I + self.N @ r_shift
-
     def integrator_derivative(
         self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray
     ) -> np.ndarray:
@@ -72,6 +67,29 @@ class BaseStateFeedbackController(ABC):
         p = plant.C.shape[0]
         return np.eye(n + p) * Q_scale, np.eye(m) * R_scale
 
+    @classmethod
+    def cost_bryson(
+        cls, plant, x_max: np.ndarray, u_max: np.ndarray, x_I_max: np.ndarray | None = None,
+        shifted: bool = False,          # True  → x_max already in shifted frame
+                                        # False → x_max in original frame, will be converted
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Bryson's rule: Q_ii = 1/x_i_max², R_ii = 1/u_i_max².
+        Returns Q (n+p × n+p) and R (m × m) for use in find_controller_gains.
+        """
+        p = plant.C.shape[0]
+
+        if x_I_max is None:
+            x_I_max = np.ones(p)
+
+        if not shifted:
+            x_max = np.abs(x_max - plant.coordinate_shift)
+
+        x_aug_max = np.concatenate([x_max, x_I_max])
+        Q = np.diag(1.0 / x_aug_max**2)
+        R = np.diag(1.0 / u_max**2)
+        return Q, R
+
     @staticmethod
     def _compute_anti_windup_gain(
         A_aug: np.ndarray, B_aug: np.ndarray, K_aug: np.ndarray, K_I: np.ndarray, alpha: float = 3.0
@@ -92,6 +110,9 @@ class BaseStateFeedbackController(ABC):
         SS_lhs = np.block([[A, B_u], [C, np.zeros((p, m))]])
         SS_rhs = np.block([[np.zeros((n, p))], [np.eye(p)]])
         N_xu   = la.solve(SS_lhs, SS_rhs)
+
+        print(f"Condition number of SS_lhs: {np.linalg.cond(SS_lhs)}")
+
         return N_xu[n:, :] - K_x @ N_xu[:n, :]
 
     # ── Subclass ────────────────────────────────────────────────────
@@ -107,9 +128,18 @@ class BaseStateFeedbackController(ABC):
     def find_controller_gains(cls, plant, **kwargs) -> "BaseStateFeedbackController":
         """Compute and return a fully constructed controller instance."""
 
+    @abstractmethod
+    def raw_input(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
+        """Compute the raw (unsaturated) control input before clipping."""
+
 
 class StateFeedbackController(BaseStateFeedbackController):
     """LQR-based state-feedback controller."""
+
+    def raw_input(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
+        z       = self.plant._to_shifted_frame(x)
+        r_shift = r - self.plant.C @ self.plant.coordinate_shift
+        return self.K_x @ z + self.K_I @ x_I + self.N @ r_shift
 
     def compute_input(self, x, x_I, r):
         u_raw = self.raw_input(x, x_I, r)
@@ -150,6 +180,11 @@ class StateFeedbackControllerDisturbanceRejection(BaseStateFeedbackController):
     def __init__(self, plant, K_x, K_I, N, M, u_min=0.0, u_max=1.0):
         super().__init__(plant, K_x, K_I, N, M, u_min, u_max)
         self.u_offset = 0.5 * (u_min + u_max)
+
+    def raw_input(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
+        z       = self.plant._to_shifted_frame(x)
+        r_shift = r - self.plant.C @ self.plant.coordinate_shift
+        return self.K_x @ z + self.K_I @ x_I
 
     def compute_input(self, x, x_I, r):
         u_valve = self.u_offset + self.raw_input(x, x_I, r)
