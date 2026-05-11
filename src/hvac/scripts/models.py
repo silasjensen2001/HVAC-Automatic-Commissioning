@@ -534,7 +534,6 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         
         # Denominator terms
         denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * (T_out - T_ref) + L) * domega_dT_out - domega_dT_out * self.c_pc * (T_out - T_ref))
-
         return numerator / denominator
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
