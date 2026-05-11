@@ -51,7 +51,7 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Instantiate controller ────────────────────────────────────────────────────
-USE_DISTURBANCE_REJECTION = False   # Toggle between LQR and H∞
+USE_DISTURBANCE_REJECTION = True    # Toggle between LQR and H∞
 USE_BRYSON = False                  # Toggle between Bryson and uniform scaling
     
 # ── Bryson bounds (physical / absolute frame) ─────────────────────────────────
@@ -80,7 +80,7 @@ N = hvac.total_states   # 4K = 20
 t_day = 24*3600
 points_per_day = t_day * 3
 
-t_end  = 30 #t_day
+t_end  = t_day
 t_eval = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -103,12 +103,14 @@ def d(t):
     Amp = 5
     T_day = 24*3600
     T_in_sys = T_in + Amp * np.sin(2*np.pi*t/T_day)
-    
+    #T_in_sys = T_in
+
     # Relative humidity disturbance
-    rh_amp = 0.25
-    rh_base = 0.75
-    rh_in = rh_base + rh_amp * np.sin(2*np.pi*t/T_day + np.pi/4)  # phase shift for variety
-    rh_in = np.clip(rh_in, 0.0, 1.0)
+    # rh_amp = 0.25
+    # rh_base = 0.75
+    # rh_in = rh_base + rh_amp * np.cos(2*np.pi*t/T_day + np.pi/4)  # phase shift for variety
+    # rh_in = np.clip(rh_in, 0.0, 1.0)
+    rh_in = 0.832  # Constant RH disturbance
     
     return np.array([T_in_sys, rh_in])  # Disturbance vector: [T_in, rh_in]
 # ── Simulate ──────────────────────────────────────────────────────────────────
@@ -156,21 +158,18 @@ e_cooler = (T1_ref - 273.15) - y_cooler
 e_heater = (T2_ref - 273.15) - y_heater
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(5, 2, figsize=(14, 20), sharex=True)
+RH_in = np.array([d(t)[1] for t in sol.t])
 
+fig, axes = plt.subplots(3, 2, figsize=(14, 12), sharex=True)
+
+# Row 0 — Air temperatures
 axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
 axes[0, 0].plot(sol.t, T_inlet, color="black", linewidth=1.5, linestyle=":", label="Inlet (actual)")
-axes[0, 0].axhline(T1_ref - 273.15,  color="green", linestyle="--", label=f"Ref ({T1_ref-273.15:.1f} °C)")
+axes[0, 0].axhline(T1_ref - 273.15, color="green", linestyle="--", label=f"Ref ({T1_ref-273.15:.1f} °C)")
 axes[0, 0].set_title("Cooler — Air Temperature")
 axes[0, 0].set_ylabel("Temperature [°C]")
 axes[0, 0].legend(fontsize=8)
 axes[0, 0].grid(True, alpha=0.35)
-
-axes[1, 0].plot(sol.t, T_water_cooler[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 0].set_title("Cooler — Water Temperature")
-axes[1, 0].set_ylabel("Temperature [°C]")
-axes[1, 0].legend(fontsize=8)
-axes[1, 0].grid(True, alpha=0.35)
 
 axes[0, 1].plot(sol.t, T_air_heater.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
 axes[0, 1].axhline(T2_ref - 273.15, color="green", linestyle="--", label=f"Ref ({T2_ref-273.15:.1f} °C)")
@@ -179,48 +178,29 @@ axes[0, 1].set_ylabel("Temperature [°C]")
 axes[0, 1].legend(fontsize=8)
 axes[0, 1].grid(True, alpha=0.35)
 
-axes[1, 1].plot(sol.t, T_water_heater[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 1].set_title("Heater — Water Temperature")
-axes[1, 1].set_ylabel("Temperature [°C]")
-axes[1, 1].legend(fontsize=8)
+# Row 1 — Valve openings
+axes[1, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
+axes[1, 0].set_title("Valve Opening — Cooler")
+axes[1, 0].set_ylabel("Opening [-]")
+axes[1, 0].set_ylim(-0.05, 1.05)
+axes[1, 0].grid(True, alpha=0.35)
+
+axes[1, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
+axes[1, 1].set_title("Valve Opening — Heater")
+axes[1, 1].set_ylabel("Opening [-]")
+axes[1, 1].set_ylim(-0.05, 1.05)
 axes[1, 1].grid(True, alpha=0.35)
 
-axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
-axes[2, 0].set_title("Integrator State — Cooler")
-axes[2, 0].set_ylabel("x_I [K·s]")
+# Row 2 — Relative humidity (shared across both columns → span via GridSpec trick)
+# Use only one subplot; hide the right twin
+axes[2, 0].plot(sol.t, RH_in, color="steelblue", linewidth=2)
+axes[2, 0].set_title("Inlet Relative Humidity")
+axes[2, 0].set_ylabel("RH [-]")
+axes[2, 0].set_ylim(-0.05, 1.05)
+axes[2, 0].set_xlabel("Time [s]")
 axes[2, 0].grid(True, alpha=0.35)
 
-axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
-axes[2, 1].set_title("Integrator State — Heater")
-axes[2, 1].set_ylabel("x_I [K·s]")
-axes[2, 1].grid(True, alpha=0.35)
-
-# Row 3 — Control contributions + sum
-for col, label in enumerate(["Cooler", "Heater"]):
-    combined = Kx_x_hist[col] + KI_xI_hist[col]
-    axes[3, col].plot(sol.t, Kx_x_hist[col],  color="teal",         linewidth=1.5, linestyle="--", label="Kx·x")
-    axes[3, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=1.5, linestyle="--", label="KI·xI")
-    axes[3, col].plot(sol.t, Nr_hist[col],     color="goldenrod",    linewidth=1.5, linestyle="--", label="Nr·r")
-    axes[3, col].plot(sol.t, combined,         color="black",        linewidth=2,                   label="Sum")
-    axes[3, col].set_title(f"Control contributions — {label}")
-    axes[3, col].set_ylabel("Valve units [-]")
-    axes[3, col].legend(fontsize=8)
-    axes[3, col].grid(True, alpha=0.35)
-
-# Row 4 — Valve openings
-axes[4, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
-axes[4, 0].set_title("Valve Opening — Cooler")
-axes[4, 0].set_ylabel("Opening [-]")
-axes[4, 0].set_ylim(-0.05, 1.05)
-axes[4, 0].set_xlabel("Time [s]")
-axes[4, 0].grid(True, alpha=0.35)
-
-axes[4, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
-axes[4, 1].set_title("Valve Opening — Heater")
-axes[4, 1].set_ylabel("Opening [-]")
-axes[4, 1].set_ylim(-0.05, 1.05)
-axes[4, 1].set_xlabel("Time [s]")
-axes[4, 1].grid(True, alpha=0.35)
+axes[2, 1].set_visible(False)
 
 plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater", fontsize=13)
 plt.tight_layout()
