@@ -133,12 +133,13 @@ class HVAC:
     def _nonlinear_derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         T_air_in = d[0]
         rh_in = d[1]
+        volume_flow_wet_air = d[2]
         offset   = 0
         parts    = []
         for i, comp in enumerate(self._nl_components):
             n    = comp.num_states
             x_k  = x[offset:offset+n]
-            dxdt = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in, rh_in]))
+            dxdt = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in, rh_in, volume_flow_wet_air]))
             parts.append(dxdt)
             T_air_in = np.mean(x_k[:comp.K])   # outlet air → next component's inlet
             offset  += n
@@ -172,9 +173,10 @@ class BaseHeatExchanger(ABC):
     Control vector: u = [valve_position]
         valve_position : water valve opening    [0..1]
 
-    Disturbance vector: d = [T_in, rh_in]
+    Disturbance vector: d = [T_in, rh_in, V_wet_air]
         T_in  : air inlet temperature           [K]
         rh_in : air inlet relative humidity     [-]
+        V_wet_air : volumetric flow rate of wet air [m³/s]
     """
 
     def __init__(
@@ -376,7 +378,8 @@ class LinearHeatExchanger(BaseHeatExchanger):
     def _construct_air_state_block(self):
         # Spin up nonlinear version with identical parameters
         nonlinear = NonlinearHeatExchanger(**self._kwargs)
-                
+        volume_flow_wet_air = self.volume_flow_wet_air
+        print(f"volume_flow_wet_air for linearization: {volume_flow_wet_air:.5f} m³/s")    
         if self.type == "cooler":
             T_in_op = self.T_operational_in_cooler
             rh_op = 0.832
@@ -385,7 +388,7 @@ class LinearHeatExchanger(BaseHeatExchanger):
             T_in_op = self.T_operational_in_heater
             rh_op = 1.0
             
-        d_op = np.array([T_in_op, rh_op])
+        d_op = np.array([T_in_op, rh_op, volume_flow_wet_air])
         u_op = np.array([self.valve_operation_point])
 
         # Find equilibrium
@@ -407,12 +410,12 @@ class LinearHeatExchanger(BaseHeatExchanger):
             T_out_op = T_eq[k]
             theta_op = theta_eq[k]
 
-            f0 = seg_deriv(T_in_op, T_out_op, theta_op, rh_op)
+            f0 = seg_deriv(T_in_op, T_out_op, theta_op, rh_op, volume_flow_wet_air)
 
             # Central finite differences
-            a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op, rh_op) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op, rh_op)) / (2*self.eps)
-            b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op, rh_op) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op, rh_op)) / (2*self.eps)
-            c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps, rh_op) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps, rh_op)) / (2*self.eps)
+            a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
+            b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
+            c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps, rh_op, volume_flow_wet_air)) / (2*self.eps)
 
             # Affine offset
             d_const = f0 - a*T_in_op - b*T_out_op - c*theta_op
@@ -468,7 +471,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         super().__init__(**kwargs)
 
         self.mass_dry_air = self._mass_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
-        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system)
+        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, self.relative_humidity_in_system, self.volume_flow_wet_air)
 
         self._check_valve_model()
 
@@ -505,15 +508,15 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         mass_dry_air = (partial_pressure_dry_air * (self.delta_x * self.cross_area_wet_air * (1-omega)))/(self.gas_constant * T)
         return mass_dry_air
 
-    def _mass_flow_dry_air(self, T: float, relative_humidity:float) -> float:
+    def _mass_flow_dry_air(self, T: float, relative_humidity:float, volume_flow_wet_air: float) -> float:
 
         partial_pressure_dry_air = self.p - self._partial_pressure_vapor(T, relative_humidity)
         omega = self._omega(T, relative_humidity)
-        mass_flow_dry_air = (partial_pressure_dry_air * self.volume_flow_wet_air * (1-omega)) / (self.gas_constant * T)
+        mass_flow_dry_air = (partial_pressure_dry_air * volume_flow_wet_air * (1-omega)) / (self.gas_constant * T)
 
         return mass_flow_dry_air
 
-    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float, rh_in: float) -> float:
+    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float, rh_in: float, volume_flow_wet_air: float) -> float:
         # Cooler specific assumptions 
         relative_humidity = 1
         L = 2500.9 * 1000 # [J/kg]
@@ -521,7 +524,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         
         # mass and mass flow of dry air
         self.mass_dry_air = self._mass_dry_air(self.T_operational_in_cooler, rh_in)
-        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, rh_in)
+        self.mass_flow_dry_air = self._mass_flow_dry_air(self.T_operational_in_cooler, rh_in, volume_flow_wet_air)
 
         # omega
         omega_in = self._omega(T_in, rh_in)
@@ -545,7 +548,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * (T_out - T_ref) + L) * domega_dT_out - domega_dT_out * self.c_pc * (T_out - T_ref))
         return numerator / denominator
 
-    def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, rh_in: float) -> float:
+    def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, rh_in: float, volume_flow_wet_air: float) -> float:
         # Heater specific assumptions 
         relative_humidity = self._saturation_pressure(T_in) / self._saturation_pressure(T_out)
         
@@ -585,14 +588,15 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         theta = x[self.K:]
         T_in = d[0] # Air inlet temperature is treated as a disturbance input
         rh_in = d[1] # Disturbed inlet relative humidity
+        volume_flow_wet_air = d[2] # Volumetric flow rate of wet air disturbance
         valve_position = u[0] # Valve position is the control input
 
         theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
 
         if self.type == "cooler":
-            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k], rh_in) for k in range(self.K)])
+            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k], rh_in, volume_flow_wet_air) for k in range(self.K)])
         else: # heater
-            dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k], rh_in) for k in range(self.K)])
+            dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k], rh_in, volume_flow_wet_air) for k in range(self.K)])
 
         dtheta_dt = np.array([self._water_segment_derivative(T[k],
                 theta_in if k == 0 else theta[k - 1],

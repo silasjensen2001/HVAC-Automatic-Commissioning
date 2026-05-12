@@ -42,7 +42,7 @@ class BaseStateFeedbackController(ABC):
         anti_windup       = self.M @ (u_sat - u_raw)
         return error + anti_windup
 
-    def controller_derivatives(self, r: np.ndarray, d) -> callable:
+    def controller_derivatives(self, r: np.ndarray, d: np.ndarray) -> callable:
         """
         Returns an ODE callable for use with solve_ivp.
         Augmented state: z = [x (n_states), x_I (n_outputs)].
@@ -237,7 +237,7 @@ class StateFeedbackControllerDisturbanceRejection(BaseStateFeedbackController):
         ]
 
         # Solve the LMI optimization problem
-        cp.Problem(cp.Minimize(gamma), constraints).solve(solver=cp.CLARABEL, verbose=False)
+        cp.Problem(cp.Minimize(gamma), constraints).solve(solver=cp.CLARABEL, verbose=True)
 
         if P.value is None:
             raise RuntimeError("Bounded-input H∞ LMI failed.")
