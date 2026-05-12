@@ -207,7 +207,6 @@ class BaseHeatExchanger(ABC):
 
         self.T_operational_in_cooler = 23 + 273.15 # Was 28
         self.T_operational_in_heater = 9.9 + 273.15
-        #self.relative_humidity_in_system = 0.5
         self.relative_humidity_in_system = 0.832
 
         self.p = 101325 # [Pa] - Atmospheric pressure
@@ -535,7 +534,6 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         
         # Denominator terms
         denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * (T_out - T_ref) + L) * domega_dT_out - domega_dT_out * self.c_pc * (T_out - T_ref))
-
         return numerator / denominator
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:

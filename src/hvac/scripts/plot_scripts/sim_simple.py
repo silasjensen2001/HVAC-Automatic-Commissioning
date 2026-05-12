@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
@@ -39,7 +43,7 @@ model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
 #hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=28 + 273.15)
-hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=None)
+hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=23 + 273.15)
 
 # ── Export state-space model ──────────────────────────────────────────────────
 data_dir = Path(__file__).resolve().parent.parent / "models/linear"
@@ -76,7 +80,7 @@ N = hvac.total_states   # 4K = 20
 t_day = 24*3600
 points_per_day = t_day * 3
 
-t_end  = 30 #t_day
+t_end  = 20 #t_day
 t_eval = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -144,74 +148,49 @@ e_cooler = (T1_ref - 273.15) - y_cooler
 e_heater = (T2_ref - 273.15) - y_heater
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(5, 2, figsize=(14, 20), sharex=True)
+fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
 
-axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
-axes[0, 0].plot(sol.t, T_inlet, color="black", linewidth=1.5, linestyle=":", label="Inlet (actual)")
-axes[0, 0].axhline(T1_ref - 273.15,  color="green", linestyle="--", label=f"Ref ({T1_ref-273.15:.1f} °C)")
-axes[0, 0].set_title("Cooler — Air Temperature")
-axes[0, 0].set_ylabel("Temperature [°C]")
-axes[0, 0].legend(fontsize=8)
-axes[0, 0].grid(True, alpha=0.35)
+# Pick 4 well-separated colours from viridis
+vc = plt.cm.viridis(np.linspace(0.05, 0.95, 6))
+c_cooler, c_heater = vc[0], vc[3]          # air temp lines
+c_ref_c,  c_ref_h  = vc[1], vc[4]          # reference lines
+c_inlet             = vc[2]                 # inlet
 
-axes[1, 0].plot(sol.t, T_water_cooler[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 0].set_title("Cooler — Water Temperature")
-axes[1, 0].set_ylabel("Temperature [°C]")
-axes[1, 0].legend(fontsize=8)
-axes[1, 0].grid(True, alpha=0.35)
+# ── Top: both air temperatures ────────────────────────────────────────────────
+axes[0].plot(sol.t, T_air_cooler.mean(axis=0), color=c_cooler, linewidth=2,
+             label="Avg air — Cooler")
+axes[0].plot(sol.t, T_air_heater.mean(axis=0), color=c_heater, linewidth=2,
+             label="Avg air — Heater")
 
-axes[0, 1].plot(sol.t, T_air_heater.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
-axes[0, 1].axhline(T2_ref - 273.15, color="green", linestyle="--", label=f"Ref ({T2_ref-273.15:.1f} °C)")
-axes[0, 1].set_title("Heater — Air Temperature")
-axes[0, 1].set_ylabel("Temperature [°C]")
-axes[0, 1].legend(fontsize=8)
-axes[0, 1].grid(True, alpha=0.35)
+# References drawn only over the actual time range, no bleed on either side
+axes[0].plot([sol.t[0], sol.t[-1]], [T1_ref - 273.15] * 2, color=c_ref_c,
+             linestyle="--", label=f"Ref Cooler ({T1_ref-273.15:.1f} °C)")
+axes[0].plot([sol.t[0], sol.t[-1]], [T2_ref - 273.15] * 2, color=c_ref_h,
+             linestyle="--", label=f"Ref Heater ({T2_ref-273.15:.1f} °C)")
 
-axes[1, 1].plot(sol.t, T_water_heater[mid], color="steelblue", linewidth=2, label=f"Seg {mid+1}")
-axes[1, 1].set_title("Heater — Water Temperature")
-axes[1, 1].set_ylabel("Temperature [°C]")
-axes[1, 1].legend(fontsize=8)
-axes[1, 1].grid(True, alpha=0.35)
+axes[0].set_xlim(sol.t[0], sol.t[-1])   # pin x-axis tightly to data
+axes[0].set_title("Air Temperature — Cooler -> Heater", fontsize=12, fontweight='bold')
+axes[0].set_ylabel("Temperature [°C]", fontsize=11, fontweight='bold')
+axes[0].legend(fontsize=9, ncol=2)
+axes[0].tick_params(labelsize=10)
+axes[0].grid(True, alpha=0.35)
 
-axes[2, 0].plot(sol.t, x_I_hist[0], color="purple", linewidth=2)
-axes[2, 0].set_title("Integrator State — Cooler")
-axes[2, 0].set_ylabel("x_I [K·s]")
-axes[2, 0].grid(True, alpha=0.35)
+# ── Bottom: saturated valve signal for both valves ────────────────────────────
+for col, (label, c_line) in enumerate(zip(["Cooler", "Heater"], [c_cooler, c_heater])):
+    u_raw = Kx_x_hist[col] + KI_xI_hist[col] + Nr_hist[col]  # ← fix: compute inside loop
+    u_sat = np.clip(u_raw, 0, 1)
+    axes[1].plot(sol.t, u_sat, color=c_line, linewidth=2, label=f"u_sat — {label}")
 
-axes[2, 1].plot(sol.t, x_I_hist[1], color="purple", linewidth=2)
-axes[2, 1].set_title("Integrator State — Heater")
-axes[2, 1].set_ylabel("x_I [K·s]")
-axes[2, 1].grid(True, alpha=0.35)
+axes[1].set_xlim(sol.t[0], sol.t[-1])   # same tight x-axis on bottom
+axes[1].set_title("Valve Inputs", fontsize=12, fontweight='bold')
+axes[1].set_ylabel("Valve units [-]", fontsize=11, fontweight='bold')
+axes[1].set_xlabel("Time [s]",        fontsize=11, fontweight='bold')
+axes[1].legend(fontsize=9, ncol=2)
+axes[1].tick_params(labelsize=10)
+axes[1].grid(True, alpha=0.35)
 
-# Row 3 — Control contributions + sum
-for col, label in enumerate(["Cooler", "Heater"]):
-    combined = Kx_x_hist[col] + KI_xI_hist[col]
-    axes[3, col].plot(sol.t, Kx_x_hist[col],  color="teal",         linewidth=1.5, linestyle="--", label="Kx·x")
-    axes[3, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=1.5, linestyle="--", label="KI·xI")
-    axes[3, col].plot(sol.t, Nr_hist[col],     color="goldenrod",    linewidth=1.5, linestyle="--", label="Nr·r")
-    axes[3, col].plot(sol.t, combined,         color="black",        linewidth=2,                   label="Sum")
-    axes[3, col].set_title(f"Control contributions — {label}")
-    axes[3, col].set_ylabel("Valve units [-]")
-    axes[3, col].legend(fontsize=8)
-    axes[3, col].grid(True, alpha=0.35)
-
-# Row 4 — Valve openings
-axes[4, 0].plot(sol.t, u_hist[0], color="darkorange", linewidth=2)
-axes[4, 0].set_title("Valve Opening — Cooler")
-axes[4, 0].set_ylabel("Opening [-]")
-axes[4, 0].set_ylim(-0.05, 1.05)
-axes[4, 0].set_xlabel("Time [s]")
-axes[4, 0].grid(True, alpha=0.35)
-
-axes[4, 1].plot(sol.t, u_hist[1], color="darkorange", linewidth=2)
-axes[4, 1].set_title("Valve Opening — Heater")
-axes[4, 1].set_ylabel("Opening [-]")
-axes[4, 1].set_ylim(-0.05, 1.05)
-axes[4, 1].set_xlabel("Time [s]")
-axes[4, 1].grid(True, alpha=0.35)
-
-plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater", fontsize=13)
-plt.tight_layout()
+plt.tight_layout(pad=2.0)
+plt.savefig("hvac_simulation_results.png", dpi=300, bbox_inches='tight')
 plt.show()
 
 # ── Terminal summary ──────────────────────────────────────────────────────────

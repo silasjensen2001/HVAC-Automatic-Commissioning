@@ -13,8 +13,8 @@ model = NonlinearHeatExchanger(
     num_segments               = 5,
     num_pipes                  = 10,
     gamma                      = 951.87, # [W/K] product of heat transfer coefficient and area radiator
-    cross_area_water           = 0.000201, # [m²] cross-sectional area for water flow
-    heat_exchanger_depth       = 0.06,
+    cross_area_water           = 0.000201*2, # [m²] cross-sectional area for water flow
+    heat_exchanger_depth       = 0.06*2,
     heat_exchanger_width       = 0.5,
     heat_exchanger_height      = 0.5,
     volume_flow_wet_air        = 0.72634,   # [m³/s]
@@ -31,7 +31,7 @@ x0 = np.concatenate([T_init, theta_init])
 
 # ── Inputs: constant throughout ──────────────────────────────────────────────
 T_in           = 23.0 + 273.15   # [K]  warm humid air inlet
-valve_position = 0.353              # [0–1]  valve opening for water flow
+valve_position = 0.0             # [0–1]  valve opening for water flow
 
 def u_fn(t):
     return np.array([valve_position])
@@ -40,7 +40,7 @@ def d_fn(t):
     return np.array([T_in])
 
 # ── Integrate ─────────────────────────────────────────────────────────────────
-t_end  = 200
+t_end  = 800
 t_eval = np.linspace(0, t_end, 1000)
 
 def ode(t, x):
