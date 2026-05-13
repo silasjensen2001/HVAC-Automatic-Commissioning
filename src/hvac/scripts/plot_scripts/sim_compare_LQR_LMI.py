@@ -45,7 +45,15 @@ model_mode = "nonlinear"  # "linear" or "nonlinear"
 # If False, only the controller selected by use_lqr is simulated.
 compare_controllers = True
 
-use_lqr = True  # Used only when compare_controllers = False
+use_lqr = False  # Used only when compare_controllers = False
+
+# If True, runs a Q/R sweep for the disturbance-rejection controller.
+# This can take a while because it synthesizes and simulates many controllers.
+use_QR_tuning = False
+
+# If True, uses manually structured Q/R for the disturbance-rejection controller.
+# If False, uses StateFeedbackControllerDisturbanceRejection.cost_matrices(...)
+use_structured_QR_for_DR = True
 
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
@@ -59,38 +67,137 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 
+# ── Dimensions ────────────────────────────────────────────────────────────────
+K = hvac._lin_components[0].K
+N = hvac.total_states   # 4K = 20
+
+
+# ── Structured Q/R helper ─────────────────────────────────────────────────────
+def structured_cost_matrices(
+    plant,
+    Qx_weight: float = 1.0,
+    Qi_weight: float = 10.0,
+    R_weight: float = 1.0,
+):
+    """
+    Creates diagonal Q and R matrices using only:
+        Qx: penalty on plant states
+        Qi: penalty on integrator states
+        R:  penalty on valve/input usage
+
+    Augmented state:
+        x_aug = [x, x_I]
+
+    Cost structure:
+        Q = diag(Qx*I_n, Qi*I_p)
+        R = R*I_m
+    """
+    n = plant.A.shape[0]
+    m = plant.B_u.shape[1]
+    p = plant.C.shape[0]
+
+    Q = np.block([
+        [Qx_weight * np.eye(n), np.zeros((n, p))],
+        [np.zeros((p, n)),      Qi_weight * np.eye(p)]
+    ])
+
+    R = R_weight * np.eye(m)
+
+    return Q, R
+
+
 # ── Instantiate controller(s) ─────────────────────────────────────────────────
 controllers = {}
-Q_test_scale = 1000000
-R_test_scale = 1000
+controller_qr_labels = {}
+
+Q_test_scale = 100
+R_test_scale = 10
+
+structured_Qx_weight = 100.0
+structured_Qi_weight = 100.0
+structured_R_weight = 3.0
 
 if compare_controllers:
-    Q_dr, R_dr = StateFeedbackControllerDisturbanceRejection.cost_matrices(hvac, Q_scale=Q_test_scale, R_scale=R_test_scale)
+    if use_structured_QR_for_DR:
+        Q_dr, R_dr = structured_cost_matrices(
+            hvac,
+            Qx_weight=structured_Qx_weight,
+            Qi_weight=structured_Qi_weight,
+            R_weight=structured_R_weight,
+        )
+
+        controller_qr_labels["Disturbance rejection"] = (
+            f"DR: Qx={structured_Qx_weight:g}, "
+            f"Qi={structured_Qi_weight:g}, "
+            f"R={structured_R_weight:g}"
+        )
+    else:
+        Q_dr, R_dr = StateFeedbackControllerDisturbanceRejection.cost_matrices(
+            hvac, Q_scale=Q_test_scale, R_scale=R_test_scale
+        )
+
+        controller_qr_labels["Disturbance rejection"] = (
+            f"DR: Qscale={Q_test_scale:g}, Rscale={R_test_scale:g}"
+        )
+
     controllers["Disturbance rejection"] = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
         hvac, Q=Q_dr, R=R_dr
     )
 
-    Q_lqr, R_lqr = StateFeedbackController.cost_matrices(hvac, Q_scale=5, R_scale=10)
+    Q_lqr_scale = 5
+    R_lqr_scale = 10
+
+    Q_lqr, R_lqr = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale)
     controllers["LQR"] = StateFeedbackController.find_controller_gains(
         hvac, Q=Q_lqr, R=R_lqr
     )
 
+    controller_qr_labels["LQR"] = (
+        f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
+    )
+
 else:
     if not use_lqr:
-        Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(hvac, Q_scale=Q_test_scale, R_scale=R_test_scale)
+        if use_structured_QR_for_DR:
+            Q, R = structured_cost_matrices(
+                hvac,
+                Qx_weight=structured_Qx_weight,
+                Qi_weight=structured_Qi_weight,
+                R_weight=structured_R_weight,
+            )
+
+            controller_qr_labels["Disturbance rejection"] = (
+                f"DR: Qx={structured_Qx_weight:g}, "
+                f"Qi={structured_Qi_weight:g}, "
+                f"R={structured_R_weight:g}"
+            )
+        else:
+            Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(
+                hvac, Q_scale=Q_test_scale, R_scale=R_test_scale
+            )
+
+            controller_qr_labels["Disturbance rejection"] = (
+                f"DR: Qscale={Q_test_scale:g}, Rscale={R_test_scale:g}"
+            )
+
         controllers["Disturbance rejection"] = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
             hvac, Q=Q, R=R
         )
     else:
-        Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=5, R_scale=10)
+        Q_lqr_scale = 5
+        R_lqr_scale = 10
+
+        Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale)
         controllers["LQR"] = StateFeedbackController.find_controller_gains(
             hvac, Q=Q, R=R
         )
 
+        controller_qr_labels["LQR"] = (
+            f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
+        )
 
-# ── Dimensions ────────────────────────────────────────────────────────────────
-K = hvac._lin_components[0].K
-N = hvac.total_states   # 4K = 20
+
+qr_info_text = " | ".join(controller_qr_labels.values())
 
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -112,8 +219,8 @@ t_day = 24 * 3600
 
 
 # ── Test case selector ────────────────────────────────────────────────────────
-# Options: "sinusoid", "step", "stochastic", "constant"
-TEST_CASE = "stochastic"
+# Options: "sinusoid", "weather_profile", "step", "stochastic", "constant"
+TEST_CASE = "weather_profile"
 
 
 # ── Disturbance definitions ───────────────────────────────────────────────────
@@ -137,6 +244,24 @@ def make_disturbance(test_case: str):
         t_end = 50 #t_day
         n_eval = 200
         label = f"Sinusoidal inlet disturbance, A={Amp:.1f} °C, period={T_period/3600:.1f} h"
+        return d, t_end, n_eval, label
+    
+    elif test_case == "weather_profile":
+        def d(t):
+            shift_t = t - 54000
+
+            term1 = 23.0
+            term2 = 6.0 * np.cos((2 * np.pi * shift_t) / (86400/4))
+            term3 = 1.6 * np.cos((2 * np.pi * shift_t) / (43200/4))
+            term4 = 0.5 * np.cos((2 * np.pi * shift_t) / (28800/4))
+            term5 = 2.0 * np.sin((2 * np.pi * t) / (259200/4))
+
+            T_in_sys = term1 + term2 + term3 + term4 + term5 + 273.15
+            return np.array([T_in_sys])
+
+        t_end = 3 * t_day
+        n_eval = 5000
+        label = "Weather-like inlet disturbance with daily and multi-day harmonics"
         return d, t_end, n_eval, label
 
     elif test_case == "step":
@@ -183,7 +308,7 @@ def make_disturbance(test_case: str):
 
     else:
         raise ValueError(
-            f"Unknown TEST_CASE='{test_case}'. Use 'sinusoid', 'step', 'stochastic', or 'constant'."
+            f"Unknown TEST_CASE='{test_case}'. Use 'sinusoid', 'weather_profile', 'step', 'stochastic', or 'constant'."
         )
 
 
@@ -308,6 +433,40 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=0.1
     )
 
 
+def combined_metrics(result):
+    """
+    Combines cooler/heater metrics into one set of worst-case values.
+    This is useful for ranking Q/R tuning candidates.
+    """
+    mc = result["metrics_cooler"]
+    mh = result["metrics_heater"]
+
+    peak_output_deviation = max(mc["peak_output_deviation"], mh["peak_output_deviation"])
+    rms_output_deviation = max(mc["rms_output_deviation"], mh["rms_output_deviation"])
+    attenuation_db = max(mc["attenuation_db"], mh["attenuation_db"])
+    saturation_fraction = max(mc["saturation_fraction"], mh["saturation_fraction"])
+    peak_du_dt = max(mc["peak_du_dt"], mh["peak_du_dt"])
+
+    # Simple ranking score:
+    # - smaller RMS output deviation is better
+    # - less saturation is better
+    # - smoother valve movement is better
+    score = (
+        rms_output_deviation
+        + 10.0 * saturation_fraction
+        + 0.01 * peak_du_dt
+    )
+
+    return dict(
+        peak_output_deviation=peak_output_deviation,
+        rms_output_deviation=rms_output_deviation,
+        attenuation_db=attenuation_db,
+        saturation_fraction=saturation_fraction,
+        peak_du_dt=peak_du_dt,
+        score=score,
+    )
+
+
 # ── Simulation helper ─────────────────────────────────────────────────────────
 def simulate_controller(controller, name):
     augmented_state0 = np.concatenate([x0, np.zeros(controller.n_outputs)])
@@ -406,6 +565,236 @@ for name, controller in controllers.items():
     print(f"Simulating controller: {name}")
     results[name] = simulate_controller(controller, name)
 
+
+# ── Optional Q/R sweep for disturbance-rejection controller ───────────────────
+sweep_records = []
+
+if use_QR_tuning:
+    Qx_weights = [1, 3, 10, 30, 100]
+    Qi_weights = [1, 3, 10, 30, 100]
+    R_weights = [0.1, 0.3, 1, 3, 10]
+
+    print("\n=== Starting Q/R sweep for disturbance-rejection controller ===")
+
+    candidate_idx = 0
+
+    for Qx_weight in Qx_weights:
+        for Qi_weight in Qi_weights:
+            for R_weight in R_weights:
+                candidate_idx += 1
+
+                candidate_name = (
+                    f"DR sweep {candidate_idx}: "
+                    f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+                )
+
+                print(f"Synthesizing and simulating {candidate_name}")
+
+                try:
+                    Q_sweep, R_sweep = structured_cost_matrices(
+                        hvac,
+                        Qx_weight=Qx_weight,
+                        Qi_weight=Qi_weight,
+                        R_weight=R_weight,
+                    )
+
+                    controller_sweep = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
+                        hvac, Q=Q_sweep, R=R_sweep
+                    )
+
+                    result_sweep = simulate_controller(controller_sweep, candidate_name)
+                    combined = combined_metrics(result_sweep)
+
+                    sweep_records.append(dict(
+                        candidate_idx=candidate_idx,
+                        Qx_weight=Qx_weight,
+                        Qi_weight=Qi_weight,
+                        R_weight=R_weight,
+                        name=candidate_name,
+                        result=result_sweep,
+                        **combined,
+                    ))
+
+                except Exception as exc:
+                    print(f"  Candidate failed: {candidate_name}")
+                    print(f"  Reason: {exc}")
+
+    if len(sweep_records) > 0:
+        sweep_records_sorted = sorted(sweep_records, key=lambda item: item["score"])
+
+        print("\n=== Best Q/R sweep candidates by score ===")
+        for item in sweep_records_sorted[:10]:
+            print(
+                f"idx={item['candidate_idx']:>3}, "
+                f"Qx={item['Qx_weight']:>6}, "
+                f"Qi={item['Qi_weight']:>6}, "
+                f"R={item['R_weight']:>6}, "
+                f"score={item['score']:.6g}, "
+                f"rms={item['rms_output_deviation']:.6g}, "
+                f"peak={item['peak_output_deviation']:.6g}, "
+                f"att_db={item['attenuation_db']:.6g}, "
+                f"sat={item['saturation_fraction']:.6g}, "
+                f"du_dt={item['peak_du_dt']:.6g}"
+            )
+
+        x_sweep = np.array([item["candidate_idx"] for item in sweep_records])
+
+        peak_vals = np.array([item["peak_output_deviation"] for item in sweep_records])
+        rms_vals = np.array([item["rms_output_deviation"] for item in sweep_records])
+        attenuation_vals = np.array([item["attenuation_db"] for item in sweep_records])
+        saturation_vals = np.array([item["saturation_fraction"] for item in sweep_records])
+        du_dt_vals = np.array([item["peak_du_dt"] for item in sweep_records])
+        score_vals = np.array([item["score"] for item in sweep_records])
+
+        best_idx = sweep_records_sorted[0]["candidate_idx"]
+
+        fig_sweep, ax_sweep = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
+
+        ax_sweep[0].plot(x_sweep, peak_vals, marker="o", linewidth=1.5)
+        ax_sweep[0].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[0].set_ylabel("Peak dev. [°C]")
+        ax_sweep[0].grid(True, alpha=0.35)
+
+        ax_sweep[1].plot(x_sweep, rms_vals, marker="o", linewidth=1.5)
+        ax_sweep[1].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[1].set_ylabel("RMS dev. [°C]")
+        ax_sweep[1].grid(True, alpha=0.35)
+
+        ax_sweep[2].plot(x_sweep, attenuation_vals, marker="o", linewidth=1.5)
+        ax_sweep[2].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[2].set_ylabel("Attenuation [dB]")
+        ax_sweep[2].grid(True, alpha=0.35)
+
+        ax_sweep[3].plot(x_sweep, saturation_vals, marker="o", linewidth=1.5)
+        ax_sweep[3].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[3].set_ylabel("Saturation fraction [-]")
+        ax_sweep[3].grid(True, alpha=0.35)
+
+        ax_sweep[4].plot(x_sweep, du_dt_vals, marker="o", linewidth=1.5)
+        ax_sweep[4].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[4].set_ylabel("Peak du/dt [1/s]")
+        ax_sweep[4].grid(True, alpha=0.35)
+
+        ax_sweep[5].plot(x_sweep, score_vals, marker="o", linewidth=1.5)
+        ax_sweep[5].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+        ax_sweep[5].set_ylabel("Score [-]")
+        ax_sweep[5].set_xlabel("Candidate index")
+        ax_sweep[5].grid(True, alpha=0.35)
+
+        fig_sweep.suptitle(
+            "Q/R tuning sweep — disturbance-rejection controller\n"
+            "Dashed vertical line marks the lowest-score candidate",
+            fontweight="bold"
+        )
+
+        plt.tight_layout()
+
+        # Plot best sweep candidate against LQR, if available.
+        best_sweep = sweep_records_sorted[0]
+        best_result = best_sweep["result"]
+
+        fig_best, ax_best = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+
+        ax_best[0].plot(
+            best_result["sol"].t,
+            best_result["T_inlet"],
+            linestyle=":",
+            linewidth=2,
+            color="black",
+            label="Inlet air disturbance"
+        )
+
+        ax_best[0].plot(
+            best_result["sol"].t,
+            best_result["T_air_cooler"].mean(axis=0),
+            linewidth=2,
+            label="Avg air — Cooler (best sweep)"
+        )
+
+        ax_best[0].plot(
+            best_result["sol"].t,
+            best_result["T_air_heater"].mean(axis=0),
+            linewidth=2,
+            label="Avg air — Heater (best sweep)"
+        )
+
+        if "LQR" in results:
+            ax_best[0].plot(
+                results["LQR"]["sol"].t,
+                results["LQR"]["T_air_cooler"].mean(axis=0),
+                linewidth=1.5,
+                linestyle="--",
+                label="Avg air — Cooler (LQR)"
+            )
+
+            ax_best[0].plot(
+                results["LQR"]["sol"].t,
+                results["LQR"]["T_air_heater"].mean(axis=0),
+                linewidth=1.5,
+                linestyle="--",
+                label="Avg air — Heater (LQR)"
+            )
+
+        cooler_ref_C = T1_ref - 273.15
+        heater_ref_C = T2_ref - 273.15
+
+        ax_best[0].axhline(cooler_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Cooler ({cooler_ref_C:.1f} °C)")
+        ax_best[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
+        ax_best[0].set_title(
+            f"Best Q/R Sweep Candidate\n"
+            f"Qx={best_sweep['Qx_weight']}, "
+            f"Qi={best_sweep['Qi_weight']}, "
+            f"R={best_sweep['R_weight']}",
+            fontweight="bold"
+        )
+        ax_best[0].set_ylabel("Temperature [°C]", fontweight="bold")
+        ax_best[0].grid(True, alpha=0.35)
+        ax_best[0].legend(loc="best")
+
+        ax_best[1].plot(
+            best_result["sol"].t,
+            best_result["u_hist"][0],
+            linewidth=2,
+            label="u_sat — Cooler (best sweep)"
+        )
+
+        ax_best[1].plot(
+            best_result["sol"].t,
+            best_result["u_hist"][1],
+            linewidth=2,
+            label="u_sat — Heater (best sweep)"
+        )
+
+        if "LQR" in results:
+            ax_best[1].plot(
+                results["LQR"]["sol"].t,
+                results["LQR"]["u_hist"][0],
+                linewidth=1.5,
+                linestyle="--",
+                label="u_sat — Cooler (LQR)"
+            )
+
+            ax_best[1].plot(
+                results["LQR"]["sol"].t,
+                results["LQR"]["u_hist"][1],
+                linewidth=1.5,
+                linestyle="--",
+                label="u_sat — Heater (LQR)"
+            )
+
+        ax_best[1].set_title("Valve Inputs", fontweight="bold")
+        ax_best[1].set_xlabel("Time [s]", fontweight="bold")
+        ax_best[1].set_ylabel("Valve units [-]", fontweight="bold")
+        ax_best[1].set_ylim(-0.05, 1.05)
+        ax_best[1].grid(True, alpha=0.35)
+        ax_best[1].legend(loc="best")
+
+        plt.tight_layout()
+
+    else:
+        print("\nNo Q/R sweep candidates were successfully simulated.")
+
+
 # This is the result used for the original detailed diagnostic plot.
 if compare_controllers:
     active_name = "Disturbance rejection"
@@ -490,7 +879,15 @@ ax_compare[1].set_ylim(-0.05, 1.05)
 ax_compare[1].grid(True, alpha=0.35)
 ax_compare[1].legend(loc="best")
 
-plt.tight_layout()
+fig_compare.text(
+    0.5,
+    0.01,
+    qr_info_text,
+    ha="center",
+    fontsize=9
+)
+
+plt.tight_layout(rect=[0, 0.04, 1, 1])
 
 
 # ── Report plot: active controller only ────────────────────────────────────────
@@ -515,7 +912,15 @@ ax_report[1].set_ylim(-0.05, 1.05)
 ax_report[1].grid(True, alpha=0.35)
 ax_report[1].legend(loc="best")
 
-plt.tight_layout()
+fig_report.text(
+    0.5,
+    0.01,
+    controller_qr_labels[active_name],
+    ha="center",
+    fontsize=9
+)
+
+plt.tight_layout(rect=[0, 0.04, 1, 1])
 
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
@@ -589,7 +994,7 @@ axes[5, 1].set_ylim(-0.05, 1.05)
 axes[5, 1].set_xlabel("Time [s]")
 axes[5, 1].grid(True, alpha=0.35)
 
-plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater — {active_name}", fontsize=13)
+plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater — {active_name}\n{controller_qr_labels[active_name]}", fontsize=13)
 plt.tight_layout()
 plt.show()
 
@@ -598,6 +1003,10 @@ plt.show()
 print(f"\n=== Test case ===")
 print(f"  {TEST_CASE}")
 print(f"  {disturbance_label}")
+
+print(f"\n=== Controller Q/R settings ===")
+for name, label in controller_qr_labels.items():
+    print(f"  {name}: {label}")
 
 for name, result in results.items():
     print(f"\n\n============================================================")
