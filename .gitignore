@@ -148,6 +148,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+hvac_venv/
 
 # Spyder project settings
 .spyderproject
