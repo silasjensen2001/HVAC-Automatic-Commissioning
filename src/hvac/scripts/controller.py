@@ -111,7 +111,7 @@ class BaseStateFeedbackController(ABC):
         SS_rhs = np.block([[np.zeros((n, p))], [np.eye(p)]])
         N_xu   = la.solve(SS_lhs, SS_rhs)
 
-        print(f"Condition number of SS_lhs: {np.linalg.cond(SS_lhs)}")
+        #print(f"Condition number of SS_lhs: {np.linalg.cond(SS_lhs)}")
 
         return N_xu[n:, :] - K_x @ N_xu[:n, :]
 

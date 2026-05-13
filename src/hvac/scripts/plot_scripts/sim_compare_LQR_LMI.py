@@ -6,6 +6,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from models import HVAC
 from controller import StateFeedbackControllerDisturbanceRejection, StateFeedbackController
 
@@ -41,19 +43,17 @@ params_heater = dict(
 
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
-# If True, both controllers are simulated using the exact same disturbance.
-# If False, only the controller selected by use_lqr is simulated.
 compare_controllers = True
+use_lqr = False
 
-use_lqr = False  # Used only when compare_controllers = False
-
-# If True, runs a Q/R sweep for the disturbance-rejection controller.
-# This can take a while because it synthesizes and simulates many controllers.
 use_QR_tuning = False
+use_parallel_QR_tuning = False
+max_parallel_workers = 20
 
-# If True, uses manually structured Q/R for the disturbance-rejection controller.
-# If False, uses StateFeedbackControllerDisturbanceRejection.cost_matrices(...)
 use_structured_QR_for_DR = True
+
+deadband_margin = 0.05  # [°C], acceptable temperature margin around reference
+metrics_ignore_fraction = 0.001  # Ignore first 0.1% of simulation when computing metrics
 
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
@@ -113,9 +113,9 @@ controller_qr_labels = {}
 Q_test_scale = 100
 R_test_scale = 10
 
-structured_Qx_weight = 100.0
-structured_Qi_weight = 100.0
-structured_R_weight = 3.0
+structured_Qx_weight = 10.0
+structured_Qi_weight = 5.0
+structured_R_weight = 5.0
 
 if compare_controllers:
     if use_structured_QR_for_DR:
@@ -144,8 +144,8 @@ if compare_controllers:
         hvac, Q=Q_dr, R=R_dr
     )
 
-    Q_lqr_scale = 5
-    R_lqr_scale = 10
+    Q_lqr_scale = 10000
+    R_lqr_scale = 8
 
     Q_lqr, R_lqr = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale)
     controllers["LQR"] = StateFeedbackController.find_controller_gains(
@@ -214,13 +214,13 @@ T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
 T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
 r      = np.array([T1_ref, T2_ref])
 
-T_in = 23 + 273.15       # Nominal air inlet to cooler [K]
+T_in = 23 + 273.15
 t_day = 24 * 3600
 
 
 # ── Test case selector ────────────────────────────────────────────────────────
 # Options: "sinusoid", "weather_profile", "step", "stochastic", "constant"
-TEST_CASE = "weather_profile"
+TEST_CASE = "constant"
 
 
 # ── Disturbance definitions ───────────────────────────────────────────────────
@@ -250,23 +250,23 @@ def make_disturbance(test_case: str):
         def d(t):
             shift_t = t - 54000
 
-            term1 = 23.0
-            term2 = 6.0 * np.cos((2 * np.pi * shift_t) / (86400/4))
-            term3 = 1.6 * np.cos((2 * np.pi * shift_t) / (43200/4))
-            term4 = 0.5 * np.cos((2 * np.pi * shift_t) / (28800/4))
-            term5 = 2.0 * np.sin((2 * np.pi * t) / (259200/4))
+            term1 = 18.0
+            term2 = 6.0 * np.cos((2 * np.pi * shift_t) / (86400))
+            term3 = 1.6 * np.cos((2 * np.pi * shift_t) / (43200))
+            term4 = 0.5 * np.cos((2 * np.pi * shift_t) / (28800))
+            term5 = 2.0 * np.sin((2 * np.pi * t) / (259200))
 
             T_in_sys = term1 + term2 + term3 + term4 + term5 + 273.15
             return np.array([T_in_sys])
 
-        t_end = 3 * t_day
+        t_end = 30#2 * t_day
         n_eval = 5000
         label = "Weather-like inlet disturbance with daily and multi-day harmonics"
         return d, t_end, n_eval, label
 
     elif test_case == "step":
-        step_amp = 5.0        # [°C]
-        step_time = 20.0      # [s]
+        step_amp = 5.0
+        step_time = 20.0
 
         def d(t):
             T_in_sys = T_in + (step_amp if t >= step_time else 0.0)
@@ -278,8 +278,8 @@ def make_disturbance(test_case: str):
         return d, t_end, n_eval, label
 
     elif test_case == "stochastic":
-        sigma = 3.0           # [°C], random inlet fluctuation size
-        sample_time = 30.0    # [s], new random value every sample_time seconds
+        sigma = 3.0
+        sample_time = 30.0
         seed = 1
 
         t_end = 600 #t_day
@@ -301,8 +301,8 @@ def make_disturbance(test_case: str):
         def d(t):
             return np.array([T_in])
 
-        t_end = 1000
-        n_eval = 300
+        t_end = 30
+        n_eval = 3000
         label = "Constant inlet temperature"
         return d, t_end, n_eval, label
 
@@ -318,15 +318,6 @@ t_eval = np.linspace(0, t_end, n_eval)
 
 # ── Performance metrics ───────────────────────────────────────────────────────
 def step_metrics(t, y, target, step_time=0.0, tol=0.02):
-    """
-    Basic step-response-like metrics.
-
-    For normal reference tracking:
-        target = desired setpoint.
-
-    For disturbance rejection:
-        target = the value the output should return to after the disturbance.
-    """
     t = np.asarray(t)
     y = np.asarray(y)
 
@@ -344,7 +335,6 @@ def step_metrics(t, y, target, step_time=0.0, tol=0.02):
     error = y2 - y_final
     peak_error = np.max(np.abs(error))
 
-    # Overshoot relative to final value
     if abs(delta) > 1e-9:
         if delta > 0:
             overshoot = max(0.0, np.max(y2) - y_final) / abs(delta) * 100.0
@@ -353,7 +343,6 @@ def step_metrics(t, y, target, step_time=0.0, tol=0.02):
     else:
         overshoot = np.nan
 
-    # Rise time: 10% to 90% of the movement toward final value
     rise_time = np.nan
     if abs(delta) > 1e-9:
         y10 = y_initial + 0.1 * delta
@@ -369,7 +358,6 @@ def step_metrics(t, y, target, step_time=0.0, tol=0.02):
         if len(idx10) > 0 and len(idx90) > 0:
             rise_time = t2[idx90[0]] - t2[idx10[0]]
 
-    # Settling time: time after which signal stays within tol band around target
     band = tol * max(1.0, abs(y_final))
     outside = np.where(np.abs(error) > band)[0]
 
@@ -388,7 +376,136 @@ def step_metrics(t, y, target, step_time=0.0, tol=0.02):
     )
 
 
-def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=0.1):
+def deadband_error_metrics(t, y, reference, margin=0.02):
+    """
+    Measures only the part of the output error that exceeds the allowed margin.
+
+    If |y - reference| <= margin:
+        contribution = 0
+
+    If |y - reference| > margin:
+        contribution = |y - reference| - margin
+    """
+    t = np.asarray(t)
+    y = np.asarray(y)
+
+    error = y - reference
+    excess_error = np.maximum(np.abs(error) - margin, 0.0)
+
+    deadband_iae = np.trapezoid(excess_error, t)
+    deadband_rms = np.sqrt(np.mean(excess_error**2))
+    deadband_peak = np.max(excess_error)
+
+    outside = excess_error > 0
+    time_outside = np.trapezoid(outside.astype(float), t)
+    fraction_outside = time_outside / (t[-1] - t[0])
+
+    return dict(
+        deadband_iae=deadband_iae,
+        deadband_rms=deadband_rms,
+        deadband_peak=deadband_peak,
+        time_outside=time_outside,
+        fraction_outside=fraction_outside,
+    )
+
+
+def deadband_excursion_metrics(t, y, reference, margin=0.02):
+    """
+    Measures how often and how long the output leaves the acceptable band.
+    """
+    t = np.asarray(t)
+    y = np.asarray(y)
+
+    error = y - reference
+    outside = np.abs(error) > margin
+
+    excursions = []
+    start_time = None
+
+    for i in range(len(t)):
+        if outside[i] and start_time is None:
+            start_time = t[i]
+
+        if not outside[i] and start_time is not None:
+            excursions.append(t[i] - start_time)
+            start_time = None
+
+    if start_time is not None:
+        excursions.append(t[-1] - start_time)
+
+    excursions = np.array(excursions)
+
+    if len(excursions) == 0:
+        return dict(
+            n_excursions=0,
+            mean_excursion_time=0.0,
+            max_excursion_time=0.0,
+        )
+
+    return dict(
+        n_excursions=len(excursions),
+        mean_excursion_time=np.mean(excursions),
+        max_excursion_time=np.max(excursions),
+    )
+
+
+def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
+    """
+    Measures valve usage, saturation, and movement.
+
+    total_variation is especially useful as a valve-wear/control-effort metric:
+        sum |u[k+1] - u[k]|
+
+    integrated_absolute_rate is the continuous-time equivalent:
+        integral |du/dt| dt
+    """
+    t = np.asarray(t)
+    u = np.asarray(u)
+
+    sat_low = u <= u_min + tol
+    sat_high = u >= u_max - tol
+    saturated = sat_low | sat_high
+
+    saturation_time = np.trapezoid(saturated.astype(float), t)
+    saturation_fraction = saturation_time / (t[-1] - t[0])
+
+    high_saturation_time = np.trapezoid(sat_high.astype(float), t)
+    low_saturation_time = np.trapezoid(sat_low.astype(float), t)
+
+    high_saturation_fraction = high_saturation_time / (t[-1] - t[0])
+    low_saturation_fraction = low_saturation_time / (t[-1] - t[0])
+
+    du = np.diff(u)
+    dt = np.diff(t)
+    du_dt = du / dt
+
+    total_variation = np.sum(np.abs(du))
+    integrated_absolute_rate = np.trapezoid(np.abs(du_dt), t[:-1])
+    rms_du_dt = np.sqrt(np.mean(du_dt**2))
+    peak_du_dt = np.max(np.abs(du_dt))
+
+    mean_u = np.mean(u)
+    rms_u = np.sqrt(np.mean(u**2))
+
+    return dict(
+        mean_u=mean_u,
+        rms_u=rms_u,
+        min_u=np.min(u),
+        max_u=np.max(u),
+        total_variation=total_variation,
+        integrated_absolute_rate=integrated_absolute_rate,
+        rms_du_dt=rms_du_dt,
+        peak_du_dt=peak_du_dt,
+        saturation_time=saturation_time,
+        saturation_fraction=saturation_fraction,
+        high_saturation_time=high_saturation_time,
+        high_saturation_fraction=high_saturation_fraction,
+        low_saturation_time=low_saturation_time,
+        low_saturation_fraction=low_saturation_fraction,
+    )
+
+
+def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=metrics_ignore_fraction):
     """
     Metrics that are useful for all disturbance cases.
     """
@@ -403,7 +520,7 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=0.1
 
     peak_output_deviation = np.max(np.abs(y_dev))
     rms_output_deviation = np.sqrt(np.mean(y_dev**2))
-    iae = np.trapz(np.abs(y_dev), t[idx])
+    iae = np.trapezoid(np.abs(y_dev), t[idx])
 
     inlet_peak_to_peak = np.ptp(inlet[idx])
     output_peak_to_peak = np.ptp(y[idx])
@@ -415,10 +532,9 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=0.1
         attenuation_ratio = np.nan
         attenuation_db = np.nan
 
-    du_dt = np.diff(u) / np.diff(t)
-    peak_du_dt = np.max(np.abs(du_dt))
-
-    saturation_fraction = np.mean((u <= 1e-6) | (u >= 1.0 - 1e-6))
+    deadband = deadband_error_metrics(t[idx], y[idx], reference, margin=deadband_margin)
+    excursions = deadband_excursion_metrics(t[idx], y[idx], reference, margin=deadband_margin)
+    actuator = actuator_metrics(t[idx], u[idx])
 
     return dict(
         peak_output_deviation=peak_output_deviation,
@@ -428,15 +544,38 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=0.1
         output_peak_to_peak=output_peak_to_peak,
         attenuation_ratio=attenuation_ratio,
         attenuation_db=attenuation_db,
-        peak_du_dt=peak_du_dt,
-        saturation_fraction=saturation_fraction,
+
+        deadband_iae=deadband["deadband_iae"],
+        deadband_rms=deadband["deadband_rms"],
+        deadband_peak=deadband["deadband_peak"],
+        time_outside=deadband["time_outside"],
+        fraction_outside=deadband["fraction_outside"],
+
+        n_excursions=excursions["n_excursions"],
+        mean_excursion_time=excursions["mean_excursion_time"],
+        max_excursion_time=excursions["max_excursion_time"],
+
+        mean_u=actuator["mean_u"],
+        rms_u=actuator["rms_u"],
+        min_u=actuator["min_u"],
+        max_u=actuator["max_u"],
+        total_variation=actuator["total_variation"],
+        integrated_absolute_rate=actuator["integrated_absolute_rate"],
+        rms_du_dt=actuator["rms_du_dt"],
+        peak_du_dt=actuator["peak_du_dt"],
+        saturation_time=actuator["saturation_time"],
+        saturation_fraction=actuator["saturation_fraction"],
+        high_saturation_time=actuator["high_saturation_time"],
+        high_saturation_fraction=actuator["high_saturation_fraction"],
+        low_saturation_time=actuator["low_saturation_time"],
+        low_saturation_fraction=actuator["low_saturation_fraction"],
     )
 
 
 def combined_metrics(result):
     """
-    Combines cooler/heater metrics into one set of worst-case values.
-    This is useful for ranking Q/R tuning candidates.
+    Combines cooler/heater metrics into one worst-case set.
+    This is used for ranking Q/R tuning candidates.
     """
     mc = result["metrics_cooler"]
     mh = result["metrics_heater"]
@@ -444,25 +583,58 @@ def combined_metrics(result):
     peak_output_deviation = max(mc["peak_output_deviation"], mh["peak_output_deviation"])
     rms_output_deviation = max(mc["rms_output_deviation"], mh["rms_output_deviation"])
     attenuation_db = max(mc["attenuation_db"], mh["attenuation_db"])
+
+    deadband_iae = max(mc["deadband_iae"], mh["deadband_iae"])
+    deadband_rms = max(mc["deadband_rms"], mh["deadband_rms"])
+    deadband_peak = max(mc["deadband_peak"], mh["deadband_peak"])
+    fraction_outside = max(mc["fraction_outside"], mh["fraction_outside"])
+    max_excursion_time = max(mc["max_excursion_time"], mh["max_excursion_time"])
+
     saturation_fraction = max(mc["saturation_fraction"], mh["saturation_fraction"])
+    high_saturation_fraction = max(mc["high_saturation_fraction"], mh["high_saturation_fraction"])
+
+    total_variation = max(mc["total_variation"], mh["total_variation"])
+    integrated_absolute_rate = max(mc["integrated_absolute_rate"], mh["integrated_absolute_rate"])
+    rms_du_dt = max(mc["rms_du_dt"], mh["rms_du_dt"])
     peak_du_dt = max(mc["peak_du_dt"], mh["peak_du_dt"])
 
-    # Simple ranking score:
-    # - smaller RMS output deviation is better
-    # - less saturation is better
-    # - smoother valve movement is better
+    simulation_time = result["sol"].t[-1] - result["sol"].t[0]
+
+    # Score philosophy:
+    #   1. stay inside the acceptable temperature band
+    #   2. minimize time outside the band
+    #   3. avoid actuator saturation
+    #   4. avoid unnecessary valve motion
+    #
+    # You can tune these coefficients depending on what matters most.
     score = (
-        rms_output_deviation
-        + 10.0 * saturation_fraction
-        + 0.01 * peak_du_dt
+        1.0  * deadband_rms
+        + 1.0 * deadband_iae / simulation_time
+        + 5.0  * fraction_outside
+        + 1.0 * saturation_fraction
+        + 10.0  * total_variation
+        + 1.0 * rms_du_dt
     )
 
     return dict(
         peak_output_deviation=peak_output_deviation,
         rms_output_deviation=rms_output_deviation,
         attenuation_db=attenuation_db,
+
+        deadband_iae=deadband_iae,
+        deadband_rms=deadband_rms,
+        deadband_peak=deadband_peak,
+        fraction_outside=fraction_outside,
+        max_excursion_time=max_excursion_time,
+
         saturation_fraction=saturation_fraction,
+        high_saturation_fraction=high_saturation_fraction,
+
+        total_variation=total_variation,
+        integrated_absolute_rate=integrated_absolute_rate,
+        rms_du_dt=rms_du_dt,
         peak_du_dt=peak_du_dt,
+
         score=score,
     )
 
@@ -486,7 +658,7 @@ def simulate_controller(controller, name):
     T_water_cooler = sol.y[K:2*K]   - 273.15
     T_air_heater   = sol.y[2*K:3*K] - 273.15
     T_water_heater = sol.y[3*K:4*K] - 273.15
-    x_I_hist       = sol.y[N:]      # shape (n_outputs, n_timesteps)
+    x_I_hist       = sol.y[N:]
 
     u_hist = np.array([
         controller.compute_input(sol.y[:N, i], sol.y[N:, i], r)[0]
@@ -503,8 +675,8 @@ def simulate_controller(controller, name):
         for i in range(sol.y.shape[1])
     ]).T
 
-    y_cooler = sol.y[K-1]    - 273.15   # cooler air outlet, last segment
-    y_heater = sol.y[3*K-1]  - 273.15   # heater air outlet, last segment
+    y_cooler = sol.y[K-1]    - 273.15 #T_air_cooler.mean(axis=0)
+    y_heater = sol.y[3*K-1]  - 273.15 #T_air_heater.mean(axis=0) 
 
     e_cooler = (T1_ref - 273.15) - y_cooler
     e_heater = (T2_ref - 273.15) - y_heater
@@ -567,57 +739,98 @@ for name, controller in controllers.items():
 
 
 # ── Optional Q/R sweep for disturbance-rejection controller ───────────────────
+def run_sweep_candidate(candidate_idx, Qx_weight, Qi_weight, R_weight):
+    candidate_name = (
+        f"DR sweep {candidate_idx}: "
+        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+    )
+
+    Q_sweep, R_sweep = structured_cost_matrices(
+        hvac,
+        Qx_weight=Qx_weight,
+        Qi_weight=Qi_weight,
+        R_weight=R_weight,
+    )
+
+    controller_sweep = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
+        hvac, Q=Q_sweep, R=R_sweep
+    )
+
+    result_sweep = simulate_controller(controller_sweep, candidate_name)
+    combined = combined_metrics(result_sweep)
+
+    return dict(
+        candidate_idx=candidate_idx,
+        Qx_weight=Qx_weight,
+        Qi_weight=Qi_weight,
+        R_weight=R_weight,
+        name=candidate_name,
+        result=result_sweep,
+        **combined,
+    )
+
+
 sweep_records = []
 
 if use_QR_tuning:
-    Qx_weights = [1, 3, 10, 30, 100]
-    Qi_weights = [1, 3, 10, 30, 100]
-    R_weights = [0.1, 0.3, 1, 3, 10]
+    Qx_weights = [1, 5, 10, 50, 100] #[100, 500, 1000, 2000, 10000]# [1, 3, 6, 7, 10] #[1, 5, 10, 50, 100]
+    Qi_weights = [1, 5, 10, 50, 100] #[100, 500, 1000, 2000, 10000] # [1, 3, 6, 7, 10] #[1, 5, 10, 50, 100]
+    R_weights =  [0.1, 0.5, 1, 5, 10]#[1.0, 5.0, 20.0, 50.0, 100.0] # [0.01, 0.05, 0.2, 0.5, 1.0] #[0.1, 0.5, 1, 5, 10]
 
-    print("\n=== Starting Q/R sweep for disturbance-rejection controller ===")
-
+    candidates = []
     candidate_idx = 0
 
     for Qx_weight in Qx_weights:
         for Qi_weight in Qi_weights:
             for R_weight in R_weights:
                 candidate_idx += 1
+                candidates.append((candidate_idx, Qx_weight, Qi_weight, R_weight))
 
-                candidate_name = (
-                    f"DR sweep {candidate_idx}: "
-                    f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
-                )
+    print("\n=== Starting Q/R sweep for disturbance-rejection controller ===")
+    print(f"Number of candidates: {len(candidates)}")
 
-                print(f"Synthesizing and simulating {candidate_name}")
+    if use_parallel_QR_tuning:
+        print(f"Running sweep in parallel with max_workers={max_parallel_workers}")
+
+        with ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
+            future_to_candidate = {
+                executor.submit(run_sweep_candidate, *candidate): candidate
+                for candidate in candidates
+            }
+
+            for future in as_completed(future_to_candidate):
+                candidate = future_to_candidate[future]
+                idx, Qx_weight, Qi_weight, R_weight = candidate
 
                 try:
-                    Q_sweep, R_sweep = structured_cost_matrices(
-                        hvac,
-                        Qx_weight=Qx_weight,
-                        Qi_weight=Qi_weight,
-                        R_weight=R_weight,
+                    record = future.result()
+                    sweep_records.append(record)
+                    print(
+                        f"Finished candidate {idx}: "
+                        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}, "
+                        f"score={record['score']:.6g}"
                     )
-
-                    controller_sweep = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
-                        hvac, Q=Q_sweep, R=R_sweep
-                    )
-
-                    result_sweep = simulate_controller(controller_sweep, candidate_name)
-                    combined = combined_metrics(result_sweep)
-
-                    sweep_records.append(dict(
-                        candidate_idx=candidate_idx,
-                        Qx_weight=Qx_weight,
-                        Qi_weight=Qi_weight,
-                        R_weight=R_weight,
-                        name=candidate_name,
-                        result=result_sweep,
-                        **combined,
-                    ))
-
                 except Exception as exc:
-                    print(f"  Candidate failed: {candidate_name}")
-                    print(f"  Reason: {exc}")
+                    print(
+                        f"Candidate failed: idx={idx}, "
+                        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+                    )
+                    print(f"Reason: {exc}")
+
+    else:
+        for candidate in candidates:
+            idx, Qx_weight, Qi_weight, R_weight = candidate
+            print(f"Synthesizing and simulating candidate {idx}: Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}")
+
+            try:
+                record = run_sweep_candidate(*candidate)
+                sweep_records.append(record)
+            except Exception as exc:
+                print(
+                    f"Candidate failed: idx={idx}, "
+                    f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+                )
+                print(f"Reason: {exc}")
 
     if len(sweep_records) > 0:
         sweep_records_sorted = sorted(sweep_records, key=lambda item: item["score"])
@@ -630,49 +843,50 @@ if use_QR_tuning:
                 f"Qi={item['Qi_weight']:>6}, "
                 f"R={item['R_weight']:>6}, "
                 f"score={item['score']:.6g}, "
-                f"rms={item['rms_output_deviation']:.6g}, "
-                f"peak={item['peak_output_deviation']:.6g}, "
-                f"att_db={item['attenuation_db']:.6g}, "
+                f"deadband_rms={item['deadband_rms']:.6g}, "
+                f"frac_out={item['fraction_outside']:.6g}, "
                 f"sat={item['saturation_fraction']:.6g}, "
-                f"du_dt={item['peak_du_dt']:.6g}"
+                f"TV={item['total_variation']:.6g}, "
+                f"rms_du_dt={item['rms_du_dt']:.6g}"
             )
 
-        x_sweep = np.array([item["candidate_idx"] for item in sweep_records])
+        sweep_records_plot = sorted(sweep_records, key=lambda item: item["candidate_idx"])
+        x_sweep = np.array([item["candidate_idx"] for item in sweep_records_plot])
 
-        peak_vals = np.array([item["peak_output_deviation"] for item in sweep_records])
-        rms_vals = np.array([item["rms_output_deviation"] for item in sweep_records])
-        attenuation_vals = np.array([item["attenuation_db"] for item in sweep_records])
-        saturation_vals = np.array([item["saturation_fraction"] for item in sweep_records])
-        du_dt_vals = np.array([item["peak_du_dt"] for item in sweep_records])
-        score_vals = np.array([item["score"] for item in sweep_records])
+        deadband_rms_vals = np.array([item["deadband_rms"] for item in sweep_records_plot])
+        fraction_outside_vals = np.array([item["fraction_outside"] for item in sweep_records_plot])
+        saturation_vals = np.array([item["saturation_fraction"] for item in sweep_records_plot])
+        total_variation_vals = np.array([item["total_variation"] for item in sweep_records_plot])
+        rms_du_dt_vals = np.array([item["rms_du_dt"] for item in sweep_records_plot])
+        score_vals = np.array([item["score"] for item in sweep_records_plot])
 
         best_idx = sweep_records_sorted[0]["candidate_idx"]
 
         fig_sweep, ax_sweep = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
 
-        ax_sweep[0].plot(x_sweep, peak_vals, marker="o", linewidth=1.5)
+        ax_sweep[0].plot(x_sweep, deadband_rms_vals, marker="o", linewidth=1.5)
         ax_sweep[0].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[0].set_ylabel("Peak dev. [°C]")
+        ax_sweep[0].set_ylabel("Deadband RMS [°C]")
         ax_sweep[0].grid(True, alpha=0.35)
 
-        ax_sweep[1].plot(x_sweep, rms_vals, marker="o", linewidth=1.5)
+        ax_sweep[1].plot(x_sweep, fraction_outside_vals, marker="o", linewidth=1.5)
         ax_sweep[1].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[1].set_ylabel("RMS dev. [°C]")
+        ax_sweep[1].set_ylabel("Fraction outside [-]")
         ax_sweep[1].grid(True, alpha=0.35)
 
-        ax_sweep[2].plot(x_sweep, attenuation_vals, marker="o", linewidth=1.5)
+        ax_sweep[2].plot(x_sweep, saturation_vals, marker="o", linewidth=1.5)
         ax_sweep[2].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[2].set_ylabel("Attenuation [dB]")
+        ax_sweep[2].set_ylabel("Saturation fraction [-]")
         ax_sweep[2].grid(True, alpha=0.35)
 
-        ax_sweep[3].plot(x_sweep, saturation_vals, marker="o", linewidth=1.5)
+        ax_sweep[3].plot(x_sweep, total_variation_vals, marker="o", linewidth=1.5)
         ax_sweep[3].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[3].set_ylabel("Saturation fraction [-]")
+        ax_sweep[3].set_ylabel("Total variation [-]")
         ax_sweep[3].grid(True, alpha=0.35)
 
-        ax_sweep[4].plot(x_sweep, du_dt_vals, marker="o", linewidth=1.5)
+        ax_sweep[4].plot(x_sweep, rms_du_dt_vals, marker="o", linewidth=1.5)
         ax_sweep[4].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[4].set_ylabel("Peak du/dt [1/s]")
+        ax_sweep[4].set_ylabel("RMS du/dt [1/s]")
         ax_sweep[4].grid(True, alpha=0.35)
 
         ax_sweep[5].plot(x_sweep, score_vals, marker="o", linewidth=1.5)
@@ -682,14 +896,13 @@ if use_QR_tuning:
         ax_sweep[5].grid(True, alpha=0.35)
 
         fig_sweep.suptitle(
-            "Q/R tuning sweep — disturbance-rejection controller\n"
-            "Dashed vertical line marks the lowest-score candidate",
+            f"Q/R tuning sweep — disturbance-rejection controller\n"
+            f"Deadband margin = ±{deadband_margin:.3f} °C. Dashed line marks lowest-score candidate.",
             fontweight="bold"
         )
 
         plt.tight_layout()
 
-        # Plot best sweep candidate against LQR, if available.
         best_sweep = sweep_records_sorted[0]
         best_result = best_sweep["result"]
 
@@ -830,6 +1043,124 @@ cooler_ref_C = T1_ref - 273.15
 heater_ref_C = T2_ref - 273.15
 
 
+
+# ── Terminal summary ──────────────────────────────────────────────────────────
+print(f"\n=== Test case ===")
+print(f"  {TEST_CASE}")
+print(f"  {disturbance_label}")
+
+print(f"\n=== Controller Q/R settings ===")
+for name, label in controller_qr_labels.items():
+    print(f"  {name}: {label}")
+
+for name, result in results.items():
+    print(f"\n\n============================================================")
+    print(f"Controller: {name}")
+    print(f"============================================================")
+
+    T_air_cooler_i   = result["T_air_cooler"]
+    T_water_cooler_i = result["T_water_cooler"]
+    T_air_heater_i   = result["T_air_heater"]
+    T_water_heater_i = result["T_water_heater"]
+    u_hist_i         = result["u_hist"]
+    x_I_hist_i       = result["x_I_hist"]
+
+    print(f"\n=== Final temperatures ===")
+    print(f"  {'Seg':<6} {'Cooler Air':>12} {'Cooler Water':>14} {'Heater Air':>12} {'Heater Water':>14}")
+    print(f"  {'-'*60}")
+    for k in range(K):
+        print(f"  {k+1:<6} {T_air_cooler_i[k,-1]:>12.3f} {T_water_cooler_i[k,-1]:>14.3f}"
+              f" {T_air_heater_i[k,-1]:>12.3f} {T_water_heater_i[k,-1]:>14.3f}")
+
+    print(f"\n=== Final valve openings ===")
+    print(f"  Cooler valve: {u_hist_i[0,-1]:.4f}")
+    print(f"  Heater valve: {u_hist_i[1,-1]:.4f}")
+
+    print(f"\n=== Final integrator states ===")
+    print(f"  x_I[0] (cooler): {x_I_hist_i[0,-1]:.4f}")
+    print(f"  x_I[1] (heater): {x_I_hist_i[1,-1]:.4f}")
+
+    print(f"\n=== Disturbance rejection metrics, ignoring first {100*metrics_ignore_fraction:.1f}% of simulation ===")
+    print(f"Deadband margin: ±{deadband_margin:.3f} °C")
+
+    print(f"Cooler output:")
+    for key, value in result["metrics_cooler"].items():
+        print(f"  {key:<30}: {value:.6g}")
+
+    print(f"Heater output:")
+    for key, value in result["metrics_heater"].items():
+        print(f"  {key:<30}: {value:.6g}")
+
+    if TEST_CASE == "step":
+        print(f"\n=== Step-like response metrics after disturbance step ===")
+        print("These are measured relative to returning to the temperature reference after the inlet step.")
+
+        print(f"Cooler output:")
+        for key, value in result["step_metrics_cooler"].items():
+            print(f"  {key:<30}: {value:.6g}")
+
+        print(f"Heater output:")
+        for key, value in result["step_metrics_heater"].items():
+            print(f"  {key:<30}: {value:.6g}")
+
+# ── Compact controller comparison table ───────────────────────────────────────
+if compare_controllers and "Disturbance rejection" in results and "LQR" in results:
+    print("\n\n============================================================")
+    print("Compact controller comparison")
+    print("============================================================")
+    print(f"Deadband margin: ±{deadband_margin:.3f} °C")
+
+    comparison_keys = [
+        "deadband_rms",
+        "deadband_iae",
+        "fraction_outside",
+        "max_excursion_time",
+        "saturation_fraction",
+        "high_saturation_fraction",
+        "total_variation",
+        "integrated_absolute_rate",
+        "rms_du_dt",
+        "peak_du_dt",
+        "rms_output_deviation",
+        "peak_output_deviation",
+        "attenuation_db",
+    ]
+
+    controller_names = ["Disturbance rejection", "LQR"]
+
+    for output_name, metric_name in [
+        ("Cooler output", "metrics_cooler"),
+        ("Heater output", "metrics_heater"),
+    ]:
+        print(f"\n--- {output_name} ---")
+        print(f"{'Metric':<32} {'LMI / H-inf':>16} {'LQR':>16} {'Better':>16}")
+        print("-" * 84)
+
+        for key in comparison_keys:
+            val_lmi = results["Disturbance rejection"][metric_name][key]
+            val_lqr = results["LQR"][metric_name][key]
+
+            # For attenuation_db, more negative is better because it means stronger attenuation.
+            # For the other listed metrics, smaller is better.
+            if key == "attenuation_db":
+                if val_lmi < val_lqr:
+                    better = "LMI / H-inf"
+                elif val_lqr < val_lmi:
+                    better = "LQR"
+                else:
+                    better = "Equal"
+            else:
+                if val_lmi < val_lqr:
+                    better = "LMI / H-inf"
+                elif val_lqr < val_lmi:
+                    better = "LQR"
+                else:
+                    better = "Equal"
+
+            print(f"{key:<32} {val_lmi:>16.6g} {val_lqr:>16.6g} {better:>16}")
+
+
+
 # ── Comparison report plot: temperatures and valve inputs ─────────────────────
 fig_compare, ax_compare = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
 
@@ -965,14 +1296,12 @@ axes[2, 1].set_ylabel("x_I [K·s]")
 axes[2, 1].set_xlabel("Time [s]")
 axes[2, 1].grid(True, alpha=0.35)
 
-# Row 3 — Kx·x contribution
 for col, label in enumerate(["Cooler", "Heater"]):
     axes[3, col].plot(sol.t, Kx_x_hist[col], color="teal", linewidth=2)
     axes[3, col].set_title(f"Kx·x — {label}")
     axes[3, col].set_ylabel("Kx·x [valve units]")
     axes[3, col].grid(True, alpha=0.35)
 
-# Row 4 — KI·xI contribution
 for col, label in enumerate(["Cooler", "Heater"]):
     axes[4, col].plot(sol.t, KI_xI_hist[col], color="mediumorchid", linewidth=2)
     axes[4, col].set_title(f"KI·xI — {label}")
@@ -999,59 +1328,3 @@ plt.tight_layout()
 plt.show()
 
 
-# ── Terminal summary ──────────────────────────────────────────────────────────
-print(f"\n=== Test case ===")
-print(f"  {TEST_CASE}")
-print(f"  {disturbance_label}")
-
-print(f"\n=== Controller Q/R settings ===")
-for name, label in controller_qr_labels.items():
-    print(f"  {name}: {label}")
-
-for name, result in results.items():
-    print(f"\n\n============================================================")
-    print(f"Controller: {name}")
-    print(f"============================================================")
-
-    T_air_cooler_i   = result["T_air_cooler"]
-    T_water_cooler_i = result["T_water_cooler"]
-    T_air_heater_i   = result["T_air_heater"]
-    T_water_heater_i = result["T_water_heater"]
-    u_hist_i         = result["u_hist"]
-    x_I_hist_i       = result["x_I_hist"]
-
-    print(f"\n=== Final temperatures ===")
-    print(f"  {'Seg':<6} {'Cooler Air':>12} {'Cooler Water':>14} {'Heater Air':>12} {'Heater Water':>14}")
-    print(f"  {'-'*60}")
-    for k in range(K):
-        print(f"  {k+1:<6} {T_air_cooler_i[k,-1]:>12.3f} {T_water_cooler_i[k,-1]:>14.3f}"
-              f" {T_air_heater_i[k,-1]:>12.3f} {T_water_heater_i[k,-1]:>14.3f}")
-
-    print(f"\n=== Final valve openings ===")
-    print(f"  Cooler valve: {u_hist_i[0,-1]:.4f}")
-    print(f"  Heater valve: {u_hist_i[1,-1]:.4f}")
-
-    print(f"\n=== Final integrator states ===")
-    print(f"  x_I[0] (cooler): {x_I_hist_i[0,-1]:.4f}")
-    print(f"  x_I[1] (heater): {x_I_hist_i[1,-1]:.4f}")
-
-    print(f"\n=== Disturbance rejection metrics, ignoring first 10% of simulation ===")
-    print(f"Cooler output:")
-    for key, value in result["metrics_cooler"].items():
-        print(f"  {key:<24}: {value:.6g}")
-
-    print(f"Heater output:")
-    for key, value in result["metrics_heater"].items():
-        print(f"  {key:<24}: {value:.6g}")
-
-    if TEST_CASE == "step":
-        print(f"\n=== Step-like response metrics after disturbance step ===")
-        print("These are measured relative to returning to the temperature reference after the inlet step.")
-
-        print(f"Cooler output:")
-        for key, value in result["step_metrics_cooler"].items():
-            print(f"  {key:<24}: {value:.6g}")
-
-        print(f"Heater output:")
-        for key, value in result["step_metrics_heater"].items():
-            print(f"  {key:<24}: {value:.6g}")
