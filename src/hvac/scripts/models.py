@@ -130,30 +130,34 @@ class HVAC:
     def _to_shifted_frame(self, x: np.ndarray) -> np.ndarray:
         return x - self.coordinate_shift
 
-    def _nonlinear_derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
-        T_air_in = d[0]
-        rh_in = d[1]
+    def _nonlinear_derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> tuple:
+        T_air_in            = d[0]
+        rh_in               = d[1]
         volume_flow_wet_air = d[2]
-        offset   = 0
-        parts    = []
+        offset      = 0
+        dxdt_parts  = []
+        omega_parts = []
+
         for i, comp in enumerate(self._nl_components):
-            n    = comp.num_states
-            x_k  = x[offset:offset+n]
-            dxdt = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in, rh_in, volume_flow_wet_air]))
-            parts.append(dxdt)
-            T_air_in = np.mean(x_k[:comp.K])   # outlet air → next component's inlet
+            n   = comp.num_states
+            x_k = x[offset:offset+n]
+            dxdt_k, omega_k = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in, rh_in, volume_flow_wet_air]))
+            dxdt_parts.append(dxdt_k)
+            omega_parts.append(omega_k)
+            T_air_in = np.mean(x_k[:comp.K])  # outlet air → next component's inlet
             offset  += n
-        return np.concatenate(parts)
+
+        return np.concatenate(dxdt_parts), np.concatenate(omega_parts)
     
-    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
+    def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> tuple:
         if self.mode == "linear":
             z = self._to_shifted_frame(x)
-
-            # If constant disturbance, fold it into the linear dynamics as an offset
             if self.const_disturbance is not None:
-                return self.A @ z + self.B_u @ u
+                dxdt = self.A @ z + self.B_u @ u
             else:
-                return self.A @ z + self.B_u @ u + self.B_d @ d
+                dxdt = self.A @ z + self.B_u @ u + self.B_d @ d
+            omega = np.zeros(self.total_states // 2)  # no omega in linear mode
+            return dxdt, omega
         else:
             return self._nonlinear_derivatives(x, u, d)
 
@@ -369,10 +373,10 @@ class LinearHeatExchanger(BaseHeatExchanger):
     
     def _find_equilibrium(self, nonlinear: "NonlinearHeatExchanger", u_op: np.ndarray, d_op: np.ndarray) -> np.ndarray:
         x0 = np.full(nonlinear.N, self.equilibrium_initial_guess)
-        result = root(lambda x: nonlinear.derivatives(x, u_op, d_op), x0)
+        result = root(lambda x: nonlinear.derivatives(x, u_op, d_op)[0], x0)
         if not result.success:
             raise ValueError(f"Equilibrium search failed: {result.message}")
-        print(f"  Equilibrium found. Max residual: {np.abs(nonlinear.derivatives(result.x, u_op, d_op)).max():.2e}")
+        print(f"  Equilibrium found. Max residual: {np.abs(nonlinear.derivatives(result.x, u_op, d_op)[0]).max():.2e}")
         return result.x
 
     def _construct_air_state_block(self):
@@ -409,13 +413,20 @@ class LinearHeatExchanger(BaseHeatExchanger):
         for k in range(self.K):
             T_out_op = T_eq[k]
             theta_op = theta_eq[k]
+            if seg_deriv == nonlinear._air_cooler_segment_derivative:
+                f0, _ = seg_deriv(T_in_op, T_out_op, theta_op, rh_op, volume_flow_wet_air)
 
-            f0 = seg_deriv(T_in_op, T_out_op, theta_op, rh_op, volume_flow_wet_air)
+                # Central finite differences
+                a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air)[0] - seg_deriv(T_in_op - self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air)[0]) / (2*self.eps)
+                b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op, rh_op, volume_flow_wet_air)[0] - seg_deriv(T_in_op, T_out_op - self.eps, theta_op, rh_op, volume_flow_wet_air)[0]) / (2*self.eps)
+                c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps, rh_op, volume_flow_wet_air)[0] - seg_deriv(T_in_op, T_out_op, theta_op - self.eps, rh_op, volume_flow_wet_air)[0]) / (2*self.eps)
+            else:
+                f0 = seg_deriv(T_in_op, T_out_op, theta_op, rh_op, volume_flow_wet_air)
 
-            # Central finite differences
-            a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
-            b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
-            c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps, rh_op, volume_flow_wet_air)) / (2*self.eps)
+                # Central finite differences
+                a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
+                b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op, rh_op, volume_flow_wet_air)) / (2*self.eps)
+                c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps, rh_op, volume_flow_wet_air) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps, rh_op, volume_flow_wet_air)) / (2*self.eps)
 
             # Affine offset
             d_const = f0 - a*T_in_op - b*T_out_op - c*theta_op
@@ -546,7 +557,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         
         # Denominator terms
         denominator = self.mass_dry_air * (self.c_pa + omega_out * self.c_pv + (self.c_pv * (T_out - T_ref) + L) * domega_dT_out - domega_dT_out * self.c_pc * (T_out - T_ref))
-        return numerator / denominator
+        return np.array([numerator / denominator, omega_out])
 
     def _air_heater_segment_derivative(self, T_in: float, T_out: float, theta: float, rh_in: float, volume_flow_wet_air: float) -> float:
         # Heater specific assumptions 
@@ -594,9 +605,13 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
 
         if self.type == "cooler":
-            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k], rh_in, volume_flow_wet_air) for k in range(self.K)])
+            result = [self._air_cooler_segment_derivative(T_in, T[k], theta[k], rh_in, volume_flow_wet_air) for k in range(self.K)]
+            dT_dt  = np.array([r[0] for r in result])
+            omega  = np.array([r[1] for r in result])
         else: # heater
             dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k], rh_in, volume_flow_wet_air) for k in range(self.K)])
+
+            omega = np.array([self._omega(T[k], self._saturation_pressure(T_in) / self._saturation_pressure(T[k])) for k in range(self.K)])
 
         dtheta_dt = np.array([self._water_segment_derivative(T[k],
                 theta_in if k == 0 else theta[k - 1],
@@ -605,7 +620,7 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
             for k in range(self.K)
         ])
 
-        return np.concatenate([dT_dt, dtheta_dt])
+        return np.concatenate([dT_dt, dtheta_dt]), omega
     
 # - - - - - - - - - - - - - - - - Airduct - - - - - - - - - - - - - - - -
 class AirDuctModel:

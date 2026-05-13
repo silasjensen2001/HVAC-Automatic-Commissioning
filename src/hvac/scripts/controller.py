@@ -42,30 +42,36 @@ class BaseStateFeedbackController(ABC):
         anti_windup       = self.M @ (u_sat - u_raw)
         return error + anti_windup
 
-    def controller_derivatives(self, r: np.ndarray, d: np.ndarray) -> callable:
-        """
-        Returns an ODE callable for use with solve_ivp.
-        Augmented state: z = [x (n_states), x_I (n_outputs)].
-        """
+    def controller_derivatives(self, r: np.ndarray, d: np.ndarray, return_omega: bool = False) -> callable:
         N = self.plant.total_states
 
         def ode(t, augmented_state):
-            x, x_I  = augmented_state[:N], augmented_state[N:]
-            u_sat, _ = self.compute_input(x, x_I, r)
-            dx       = self.plant.derivatives(x, u_sat, d(t))
-            dx_I     = self.integrator_derivative(x, x_I, r)
-            return np.concatenate([dx, dx_I])
+            x, x_I   = augmented_state[:N], augmented_state[N:]
+            u_sat, _  = self.compute_input(x, x_I, r)
+            dx, omega = self.plant.derivatives(x, u_sat, d(t))  # always a tuple now
+            dx_I      = self.integrator_derivative(x, x_I, r)
+            dzdt      = np.concatenate([dx, dx_I])
+            if return_omega:
+                return dzdt, omega
+            return dzdt
 
         return ode
 
     @classmethod
     def cost_matrices(
-        cls, plant, Q_scale: float = 1.0, R_scale: float = 1.0
+        cls, plant, Q_scale: float = 1.0, Qi_scale: float = 1.0, R_scale: float = 1.0, use_disturbance_rejection: bool = False
     ) -> tuple[np.ndarray, np.ndarray]:
         n = plant.A.shape[0]
         m = plant.B_u.shape[1]
         p = plant.C.shape[0]
-        return np.eye(n + p) * Q_scale, np.eye(m) * R_scale
+        if use_disturbance_rejection:
+            Q = np.block([
+                [Q_scale * np.eye(n), np.zeros((n, p))],
+                [np.zeros((p, n)),      Qi_scale * np.eye(p)]
+            ])
+            return Q, np.eye(m) * R_scale
+        else:
+            return np.eye(n + p) * Q_scale, np.eye(m) * R_scale
 
     @classmethod
     def cost_bryson(
