@@ -54,7 +54,7 @@ hvac._export_state_space(data_dir / "HVAC_model.mat")
 COMPARE_CONTROLLERS       = True   # True: overlay both in one 2×1 layout
 USE_DISTURBANCE_REJECTION = True   # Used when COMPARE_CONTROLLERS = False
 USE_BRYSON                = False  # Only used for LQR (not compatible with LMI design)
-CASE_DISTURBANCE          = 4     # 1: Temp, 2: RH, 3: Flow, 4: All combined
+CASE_DISTURBANCE          = 0      # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined
 
 # ── Bryson bounds ─────────────────────────────────────────────────────────────
 x_max  = np.full(20, 20 + 273.15)
@@ -67,8 +67,8 @@ N = hvac.total_states
 
 # ── Time ──────────────────────────────────────────────────────────────────────
 t_day          = 24 * 3600
-points_per_day = t_day * 3
-t_end          = t_day * 2
+points_per_day = 3000
+t_end          = 30
 t_eval         = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -88,6 +88,11 @@ r      = np.array([T1_ref, T2_ref])
 def d(t):
     T_day = 24 * 3600
     match CASE_DISTURBANCE:
+        case 0:
+            T_in  = 23 + 273.15
+            rh_in = 0.832
+            volume_flow_wet_air = (params_cooler["volume_flow_wet_air"]
+                                   / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 1:
             shift_t = t - 54000
             T_in = (23
@@ -129,11 +134,11 @@ def build_and_simulate(use_disturbance_rejection):
         else StateFeedbackController
     )
     if use_disturbance_rejection:
-        Q, R = ControllerCls.cost_matrices(hvac, Q_scale=100.0, R_scale=3.0) #! Update figures in report when Silas is done tuning
+        Q, R = ControllerCls.cost_matrices(hvac, Q_scale=10.0, Qi_scale=5.0, R_scale=5.0, use_disturbance_rejection=True)
     else:
         Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max)
                 if USE_BRYSON else
-                ControllerCls.cost_matrices(hvac, Q_scale=10.0, R_scale=800.0))
+                ControllerCls.cost_matrices(hvac, Q_scale=10000.0, R_scale=8.0))
     ctrl = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
     aug0 = np.concatenate([x0, np.zeros(ctrl.n_outputs)])
     sol  = solve_ivp(
@@ -178,6 +183,7 @@ ctrl_colors = {
 }
 
 case_titles = {
+    0: "Constant Disturbances",
     1: "Temperature Disturbance Only",
     2: "Relative Humidity Disturbance Only",
     3: "Volumetric Flow Disturbance Only",
@@ -269,6 +275,7 @@ ax_valve.grid(True, alpha=0.35)
 fig.subplots_adjust(right=0.86 if CASE_DISTURBANCE == 4 else 0.93)
 plt.tight_layout()
 case_filenames = {
+    0: "Constant_disturbances",
     1: "T_in_disturbance",
     2: "RH_in_disturbance",
     3: "Air_flow_disturbance",

@@ -68,7 +68,7 @@ N = hvac.total_states
 # ── Time ──────────────────────────────────────────────────────────────────────
 t_day          = 24 * 3600
 points_per_day = 3000         #t_day * 3
-t_end          = 30           #t_day * 2
+t_end          = 30               #t_day * 2
 t_eval         = np.linspace(0, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -137,7 +137,7 @@ def build_and_simulate(use_disturbance_rejection):
     else:
         Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max)
                 if USE_BRYSON else
-                ControllerCls.cost_matrices(hvac, Q_scale=10.0, R_scale=800.0))
+                ControllerCls.cost_matrices(hvac, Q_scale=10000.0, R_scale=8.0))
     ctrl = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
     aug0 = np.concatenate([x0, np.zeros(ctrl.n_outputs)])
     sol  = solve_ivp(
