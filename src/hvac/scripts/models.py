@@ -214,9 +214,7 @@ class HVAC:
         u_idx = 0
         y_idx = 0
 
-        for nid, comp, source in zip(self._state_node_ids,
-                                     self._lin_components,
-                                     self._inlet_sources):
+        for nid, comp, source in zip(self._state_node_ids, self._lin_components, self._inlet_sources):
             off, n, _ = node_offsets[nid]
 
             A[off:off+n, off:off+n] = comp.A

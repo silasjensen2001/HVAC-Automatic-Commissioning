@@ -7,8 +7,8 @@ from controller import StateFeedbackControllerDisturbanceRejection, StateFeedbac
 
 
 # ── Flow rates ────────────────────────────────────────────────────────────────
-q_fresh  = 2615 / 3600   # fresh air intake through pre-treatment path [m³/s]
-q_main   = 8638 / 3600   # total flow in main conditioning loop [m³/s]
+q_fresh  = 2615 / 3600    # fresh air intake through pre-treatment path [m³/s]
+q_main   = 8638 / 3600 * 0.5   # total flow in main conditioning loop [m³/s]
 q_return = q_main - q_fresh   # recirculated return air [m³/s]
 
 # ── Hardware parameters — pre-treatment path (carries q_fresh) ────────────────
