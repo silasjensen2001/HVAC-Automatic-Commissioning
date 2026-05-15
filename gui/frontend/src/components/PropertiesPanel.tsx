@@ -5,6 +5,7 @@ interface Props {
   selectedEdge: Edge | null
   onUpdateNode: (id: string, updates: Record<string, unknown>) => void
   onUpdateEdge: (id: string, updates: Record<string, unknown>) => void
+  onCollapse: () => void
 }
 
 function FieldRow({
@@ -221,11 +222,16 @@ function FanForm({ data, onChange }: { data: Record<string, unknown>; onChange: 
   )
 }
 
-export default function PropertiesPanel({ selectedNode, selectedEdge, onUpdateNode, onUpdateEdge }: Props) {
+export default function PropertiesPanel({ selectedNode, selectedEdge, onUpdateNode, onUpdateEdge, onCollapse }: Props) {
+  const collapseBtn = (
+    <button className="close-btn" onClick={onCollapse} title="Hide properties panel" style={{ marginLeft: 'auto' }}>›</button>
+  )
+
   if (!selectedNode && !selectedEdge) {
     return (
       <aside className="sidebar right-sidebar empty-panel">
-        <p style={{ color: '#9ca3af', fontSize: 13, textAlign: 'center', marginTop: 32 }}>
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>{collapseBtn}</div>
+        <p style={{ color: '#9ca3af', fontSize: 13, textAlign: 'center', marginTop: 24 }}>
           Click a node or edge<br />to edit its properties
         </p>
       </aside>
@@ -236,7 +242,10 @@ export default function PropertiesPanel({ selectedNode, selectedEdge, onUpdateNo
     const edgeData = (selectedEdge.data ?? {}) as Record<string, unknown>
     return (
       <aside className="sidebar right-sidebar">
-        <h3 className="sidebar-title">Edge</h3>
+        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
+          <h3 className="sidebar-title" style={{ marginBottom: 0 }}>Edge</h3>
+          {collapseBtn}
+        </div>
         <p className="sidebar-hint">{selectedEdge.source} → {selectedEdge.target}</p>
         <FlowRateField
           value={(edgeData.flow_rate as number) ?? 1.0}
@@ -266,7 +275,10 @@ export default function PropertiesPanel({ selectedNode, selectedEdge, onUpdateNo
 
   return (
     <aside key={selectedNode.id} className="sidebar right-sidebar">
-      <h3 className="sidebar-title">{typeLabel[selectedNode.type ?? ''] ?? selectedNode.type}</h3>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 4 }}>
+        <h3 className="sidebar-title" style={{ marginBottom: 0 }}>{typeLabel[selectedNode.type ?? ''] ?? selectedNode.type}</h3>
+        {collapseBtn}
+      </div>
       <p className="sidebar-hint">ID: {selectedNode.id}</p>
       {(selectedNode.type === 'cooler' || selectedNode.type === 'heater') && (
         <HxForm data={data} onChange={onChange} />
@@ -285,6 +297,10 @@ export default function PropertiesPanel({ selectedNode, selectedEdge, onUpdateNo
       )}
       {selectedNode.type === 'exhaust' && (
         <>
+          <FlipButton
+            flipped={!!(data.flipHandles)}
+            onToggle={() => onChange('flipHandles', !(data.flipHandles ?? false))}
+          />
           <FieldRow label="Label" value={data.label as string} onChange={v => onChange('label', v)} />
           <FlowRateField
             value={data.volume_flow_rate as number}

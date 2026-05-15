@@ -107,6 +107,21 @@ body {
 .left-sidebar  { width: 210px; border-right: 1px solid #334155; }
 .right-sidebar { width: 270px; border-left:  1px solid #334155; }
 
+.sidebar-collapsed-tab {
+  width: 24px;
+  background: #1e293b;
+  border: none;
+  border-left: 1px solid #334155;
+  color: #64748b;
+  cursor: pointer;
+  writing-mode: vertical-lr;
+  font-size: 11px;
+  padding: 16px 4px;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+.sidebar-collapsed-tab:hover { color: #e2e8f0; background: #334155; }
+
 .sidebar-section { margin-bottom: 16px; }
 
 .sidebar-title {
@@ -313,13 +328,22 @@ select.field-input { cursor: pointer; }
 
 /* ── Results panel ───────────────────────────────────────────────── */
 .results-panel {
-  height: 420px;
   background: #1e293b;
   border-top: 1px solid #334155;
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
+  min-height: 40px;
 }
+
+.results-drag-handle {
+  height: 5px;
+  cursor: ns-resize;
+  background: #334155;
+  flex-shrink: 0;
+  transition: background 0.15s;
+}
+.results-drag-handle:hover { background: #6366f1; }
 
 .results-header {
   display: flex;

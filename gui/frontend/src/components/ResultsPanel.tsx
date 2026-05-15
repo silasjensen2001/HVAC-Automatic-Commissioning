@@ -1,6 +1,8 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Plot from 'react-plotly.js'
 import type { SimResults, SimMetrics } from '../types'
+
+const DEFAULT_HEIGHT = 380
 
 function downloadGains(metrics: SimMetrics, rowLabels: string[], colLabels: string[]) {
   const payload = {
@@ -44,10 +46,38 @@ interface Props {
 type Tab = 'temperatures' | 'valves' | 'metrics'
 
 export default function ResultsPanel({ results, onClose }: Props) {
-  const [tab, setTab] = useState<Tab>('temperatures')
+  const [tab,       setTab]       = useState<Tab>('temperatures')
+  const [collapsed, setCollapsed] = useState(false)
+  const [height,    setHeight]    = useState(DEFAULT_HEIGHT)
+
   const { t, outputs, valves, metrics, d_signal } = results
 
-  // ── Temperature plot ────────────────────────────────────────────────────────
+  // Tell Plotly to re-fit after height or collapsed state changes
+  useEffect(() => {
+    const id = requestAnimationFrame(() => window.dispatchEvent(new Event('resize')))
+    return () => cancelAnimationFrame(id)
+  }, [height, collapsed])
+
+  // ── Drag-to-resize ────────────────────────────────────────────────────────────
+  const onDragStart = (e: React.MouseEvent) => {
+    e.preventDefault()
+    const startY      = e.clientY
+    const startHeight = height
+
+    const onMove = (me: MouseEvent) => {
+      const delta     = startY - me.clientY   // drag up → larger
+      const newHeight = Math.max(120, Math.min(window.innerHeight - 120, startHeight + delta))
+      setHeight(newHeight)
+    }
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup',   onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup',   onUp)
+  }
+
+  // ── Traces ────────────────────────────────────────────────────────────────────
   const disturbanceTrace = {
     x: t, y: d_signal,
     type: 'scatter' as const, mode: 'lines' as const,
@@ -58,58 +88,32 @@ export default function ResultsPanel({ results, onClose }: Props) {
   const tempTraces = Object.entries(outputs).flatMap(([, series], i) => {
     const color = pickColor(series.label, i)
     return [
-      {
-        x: t,
-        y: series.y,
-        type: 'scatter' as const,
-        mode: 'lines' as const,
-        name: series.label,
-        legendgroup: series.label,
-        line: { color, width: 2 },
-      },
-      {
-        x: [t[0], t[t.length - 1]],
-        y: [series.ref, series.ref],
-        type: 'scatter' as const,
-        mode: 'lines' as const,
-        name: `${series.label} ref`,
-        legendgroup: series.label,
-        line: { color, width: 1, dash: 'dash' as const },
-        showlegend: false,
-      },
+      { x: t, y: series.y, type: 'scatter' as const, mode: 'lines' as const,
+        name: series.label, legendgroup: series.label, line: { color, width: 2 } },
+      { x: [t[0], t[t.length - 1]], y: [series.ref, series.ref],
+        type: 'scatter' as const, mode: 'lines' as const,
+        name: `${series.label} ref`, legendgroup: series.label,
+        line: { color, width: 1, dash: 'dash' as const }, showlegend: false },
     ]
   })
 
-  // ── Valve plot ───────────────────────────────────────────────────────────────
   const valveTraces = Object.entries(valves).map(([, series], i) => ({
-    x: t,
-    y: series.y,
-    type: 'scatter' as const,
-    mode: 'lines' as const,
-    name: series.label,
-    line: { color: pickColor(series.label, i), width: 2 },
+    x: t, y: series.y, type: 'scatter' as const, mode: 'lines' as const,
+    name: series.label, line: { color: pickColor(series.label, i), width: 2 },
   }))
 
-  // ── Steady-state table ───────────────────────────────────────────────────────
-  const ssRows = Object.values(metrics.steady_state)
-
-  // ── K_I heatmap ─────────────────────────────────────────────────────────────
-  const KI = metrics.K_I
-  const nRows = KI.length
-  const nCols = KI[0]?.length ?? 0
-  const rowLabels = metrics.actuated_ids.map((id, i) =>
-    metrics.steady_state[id]?.label ?? `u${i}`)
-  const colLabels = metrics.actuated_ids.map((id, i) =>
-    metrics.steady_state[id]?.label ?? `y${i}`)
-
-  // ── Pole map ─────────────────────────────────────────────────────────────────
+  // ── Metrics ───────────────────────────────────────────────────────────────────
+  const ssRows    = Object.values(metrics.steady_state)
+  const KI        = metrics.K_I
+  const nRows     = KI.length
+  const nCols     = KI[0]?.length ?? 0
+  const rowLabels = metrics.actuated_ids.map((id, i) => metrics.steady_state[id]?.label ?? `u${i}`)
+  const colLabels = metrics.actuated_ids.map((id, i) => metrics.steady_state[id]?.label ?? `y${i}`)
   const poleTrace = {
     x: metrics.cl_eigenvalues.map(e => e.re),
     y: metrics.cl_eigenvalues.map(e => e.im),
-    type: 'scatter' as const,
-    mode: 'markers' as const,
-    name: 'CL poles',
-    marker: { color: '#6366f1', size: 8, symbol: 'x' },
+    type: 'scatter' as const, mode: 'markers' as const,
+    name: 'CL poles', marker: { color: '#6366f1', size: 8, symbol: 'x' as const },
   }
 
   const commonLayout = {
@@ -121,149 +125,159 @@ export default function ResultsPanel({ results, onClose }: Props) {
   }
 
   return (
-    <section className="results-panel">
+    <section
+      className="results-panel"
+      style={{ height: collapsed ? undefined : height }}
+    >
+      {/* Drag handle — only when expanded */}
+      {!collapsed && (
+        <div className="results-drag-handle" onMouseDown={onDragStart} title="Drag to resize" />
+      )}
+
       <div className="results-header">
         <div className="tab-bar">
           {(['temperatures', 'valves', 'metrics'] as Tab[]).map(tabName => (
             <button
               key={tabName}
               className={`tab-btn${tab === tabName ? ' tab-active' : ''}`}
-              onClick={() => setTab(tabName)}
+              onClick={() => { setCollapsed(false); setTab(tabName) }}
             >
               {tabName.charAt(0).toUpperCase() + tabName.slice(1)}
             </button>
           ))}
         </div>
-        <button className="close-btn" onClick={onClose} title="Close results">✕</button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <button
+            className="close-btn"
+            onClick={() => setCollapsed(c => !c)}
+            title={collapsed ? 'Expand results' : 'Collapse results'}
+          >
+            {collapsed ? '▲' : '▼'}
+          </button>
+          <button className="close-btn" onClick={onClose} title="Close results">✕</button>
+        </div>
       </div>
 
-      <div className="results-body">
-        {tab === 'temperatures' && (
-          <Plot
-            data={[disturbanceTrace, ...tempTraces]}
-            layout={{
-              ...commonLayout,
-              title: { text: 'Air outlet temperatures', font: { color: '#e2e8f0' } },
-              xaxis: { title: 'Time (s)', gridcolor: '#334155', zerolinecolor: '#475569' },
-              yaxis: { title: 'Temperature (°C)', gridcolor: '#334155', zerolinecolor: '#475569' },
-            }}
-            style={{ width: '100%', height: '100%' }}
-            useResizeHandler
-            config={{ responsive: true }}
-          />
-        )}
+      {!collapsed && (
+        <div className="results-body">
+          {tab === 'temperatures' && (
+            <Plot
+              data={[disturbanceTrace, ...tempTraces]}
+              layout={{
+                ...commonLayout,
+                xaxis: { title: { text: 'Time (s)' },        gridcolor: '#334155', zerolinecolor: '#475569' },
+                yaxis: { title: { text: 'Temperature (°C)' }, gridcolor: '#334155', zerolinecolor: '#475569' },
+              }}
+              style={{ width: '100%', height: '100%' }}
+              useResizeHandler
+              config={{ responsive: true }}
+            />
+          )}
 
-        {tab === 'valves' && (
-          <Plot
-            data={[
-              ...valveTraces,
-              { x: [t[0], t[t.length-1]], y: [1,1], type: 'scatter', mode: 'lines',
-                line: { color: '#f87171', dash: 'dot', width: 1 }, name: 'Max', showlegend: false },
-              { x: [t[0], t[t.length-1]], y: [0,0], type: 'scatter', mode: 'lines',
-                line: { color: '#f87171', dash: 'dot', width: 1 }, name: 'Min', showlegend: false },
-            ]}
-            layout={{
-              ...commonLayout,
-              title: { text: 'Valve openings', font: { color: '#e2e8f0' } },
-              xaxis: { title: 'Time (s)', gridcolor: '#334155', zerolinecolor: '#475569' },
-              yaxis: { title: 'Opening (0–1)', range: [-0.05, 1.05], gridcolor: '#334155', zerolinecolor: '#475569' },
-            }}
-            style={{ width: '100%', height: '100%' }}
-            useResizeHandler
-            config={{ responsive: true }}
-          />
-        )}
+          {tab === 'valves' && (
+            <Plot
+              data={[
+                ...valveTraces,
+                { x: [t[0], t[t.length-1]], y: [1,1], type: 'scatter' as const, mode: 'lines' as const,
+                  line: { color: '#f87171', dash: 'dot' as const, width: 1 }, name: 'Max', showlegend: false },
+                { x: [t[0], t[t.length-1]], y: [0,0], type: 'scatter' as const, mode: 'lines' as const,
+                  line: { color: '#f87171', dash: 'dot' as const, width: 1 }, name: 'Min', showlegend: false },
+              ]}
+              layout={{
+                ...commonLayout,
+                xaxis: { title: { text: 'Time (s)' },         gridcolor: '#334155', zerolinecolor: '#475569' },
+                yaxis: { title: { text: 'Opening (0–1)' }, range: [-0.05, 1.05], gridcolor: '#334155', zerolinecolor: '#475569' },
+              }}
+              style={{ width: '100%', height: '100%' }}
+              useResizeHandler
+              config={{ responsive: true }}
+            />
+          )}
 
-        {tab === 'metrics' && (
-          <div className="metrics-grid">
-            {/* Steady-state table */}
-            <div className="metric-card">
-              <h4 className="metric-title">Steady-state summary</h4>
-              <table className="ss-table">
-                <thead>
-                  <tr>
-                    <th>Node</th><th>Final (°C)</th><th>Ref (°C)</th><th>Error (°C)</th><th>Valve</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ssRows.map(row => {
-                    const err = row.temp_C - row.ref_C
-                    return (
-                      <tr key={row.label}>
-                        <td>{row.label}</td>
-                        <td>{row.temp_C.toFixed(2)}</td>
-                        <td>{row.ref_C.toFixed(2)}</td>
-                        <td style={{ color: Math.abs(err) > 0.5 ? '#f87171' : '#34d399' }}>
-                          {err.toFixed(3)}
-                        </td>
-                        <td>{row.valve.toFixed(3)}</td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-              <p className="metric-note">Condition number: {metrics.condition_number.toExponential(3)}</p>
-            </div>
-
-            {/* K_I heatmap */}
-            <div className="metric-card">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                <h4 className="metric-title" style={{ marginBottom: 0 }}>K_I gain matrix (integral action)</h4>
-                <button
-                  onClick={() => downloadGains(metrics, rowLabels, colLabels)}
-                  style={{ background: '#1e3a5f', border: '1px solid #3b82f6', color: '#93c5fd', borderRadius: 4, padding: '3px 10px', fontSize: 11, cursor: 'pointer' }}
-                >
-                  ↓ Save gains
-                </button>
+          {tab === 'metrics' && (
+            <div className="metrics-grid">
+              {/* Steady-state table */}
+              <div className="metric-card">
+                <h4 className="metric-title">Steady-state summary</h4>
+                <table className="ss-table">
+                  <thead>
+                    <tr><th>Node</th><th>Final (°C)</th><th>Ref (°C)</th><th>Error (°C)</th><th>Valve</th></tr>
+                  </thead>
+                  <tbody>
+                    {ssRows.map(row => {
+                      const err = row.temp_C - row.ref_C
+                      return (
+                        <tr key={row.label}>
+                          <td>{row.label}</td>
+                          <td>{row.temp_C.toFixed(2)}</td>
+                          <td>{row.ref_C.toFixed(2)}</td>
+                          <td style={{ color: Math.abs(err) > 0.5 ? '#f87171' : '#34d399' }}>{err.toFixed(3)}</td>
+                          <td>{row.valve.toFixed(3)}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+                <p className="metric-note">Condition number: {metrics.condition_number.toExponential(3)}</p>
               </div>
-              <Plot
-                data={[{
-                  z:         KI,
-                  x:         colLabels.slice(0, nCols),
-                  y:         rowLabels.slice(0, nRows),
-                  type:      'heatmap' as const,
-                  colorscale:'RdBu',
-                  reversescale: true,
-                  zmid:      0,
-                  text:      KI.map(row => row.map(v => v.toFixed(4))),
-                  texttemplate: '%{text}',
-                  hovertemplate: 'Input: %{y}<br>Output: %{x}<br>Gain: %{z:.4f}<extra></extra>',
-                }]}
-                layout={{
-                  ...commonLayout,
-                  margin: { t: 10, r: 20, b: 80, l: 120 },
-                  xaxis: { title: 'Output channel', tickangle: -30 },
-                  yaxis: { title: 'Input channel' },
-                }}
-                style={{ width: '100%', height: 280 }}
-                useResizeHandler
-                config={{ responsive: true }}
-              />
-            </div>
 
-            {/* Pole map */}
-            <div className="metric-card">
-              <h4 className="metric-title">Closed-loop poles</h4>
-              <Plot
-                data={[
-                  poleTrace,
-                  { x: [0,0], y: [-1,1].map(v => v * (Math.max(...metrics.cl_eigenvalues.map(e=>Math.abs(e.im)))||1)*1.2),
-                    type:'scatter', mode:'lines', line:{color:'#64748b',width:1,dash:'dot'}, showlegend:false, name:'Im axis' },
-                ]}
-                layout={{
-                  ...commonLayout,
-                  margin: { t: 10, r: 20, b: 50, l: 60 },
-                  xaxis: { title: 'Real', gridcolor: '#334155', zerolinecolor: '#94a3b8' },
-                  yaxis: { title: 'Imaginary', gridcolor: '#334155', zerolinecolor: '#94a3b8' },
-                }}
-                style={{ width: '100%', height: 280 }}
-                useResizeHandler
-                config={{ responsive: true }}
-              />
+              {/* K_I heatmap */}
+              <div className="metric-card">
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+                  <h4 className="metric-title" style={{ marginBottom: 0 }}>K_I gain matrix</h4>
+                  <button
+                    onClick={() => downloadGains(metrics, rowLabels, colLabels)}
+                    style={{ background: '#1e3a5f', border: '1px solid #3b82f6', color: '#93c5fd', borderRadius: 4, padding: '3px 10px', fontSize: 11, cursor: 'pointer' }}
+                  >
+                    ↓ Save gains
+                  </button>
+                </div>
+                <Plot
+                  data={[{
+                    z: KI, x: colLabels.slice(0, nCols), y: rowLabels.slice(0, nRows),
+                    type: 'heatmap' as const, colorscale: 'RdBu', reversescale: true,
+                    zmid: 0,
+                    text: KI.map(row => row.map(v => v.toFixed(4))) as unknown as string[],
+                    texttemplate: '%{text}',
+                    hovertemplate: 'Input: %{y}<br>Output: %{x}<br>Gain: %{z:.4f}<extra></extra>',
+                  } as never]}
+                  layout={{
+                    ...commonLayout,
+                    margin: { t: 10, r: 20, b: 80, l: 120 },
+                    xaxis: { title: { text: 'Output channel' }, tickangle: -30 },
+                    yaxis: { title: { text: 'Input channel'  } },
+                  }}
+                  style={{ width: '100%', height: 280 }}
+                  useResizeHandler
+                  config={{ responsive: true }}
+                />
+              </div>
+
+              {/* Pole map */}
+              <div className="metric-card">
+                <h4 className="metric-title">Closed-loop poles</h4>
+                <Plot
+                  data={[
+                    poleTrace,
+                    { x: [0,0], y: [-1,1].map(v => v * (Math.max(...metrics.cl_eigenvalues.map(e => Math.abs(e.im)))||1)*1.2),
+                      type: 'scatter' as const, mode: 'lines' as const,
+                      line: { color: '#64748b', width: 1, dash: 'dot' as const }, showlegend: false, name: 'Im axis' },
+                  ]}
+                  layout={{
+                    ...commonLayout,
+                    margin: { t: 10, r: 20, b: 50, l: 60 },
+                    xaxis: { title: { text: 'Real' },      gridcolor: '#334155', zerolinecolor: '#94a3b8' },
+                    yaxis: { title: { text: 'Imaginary' }, gridcolor: '#334155', zerolinecolor: '#94a3b8' },
+                  }}
+                  style={{ width: '100%', height: 280 }}
+                  useResizeHandler
+                  config={{ responsive: true }}
+                />
+              </div>
             </div>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
     </section>
   )
 }

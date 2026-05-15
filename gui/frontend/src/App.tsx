@@ -121,6 +121,7 @@ export default function App() {
   const [showResults, setShowResults]   = useState(false)
   const [warnings, setWarnings]         = useState<GraphWarning[]>([])
   const [showWarnings, setShowWarnings] = useState(false)
+  const [rightOpen, setRightOpen]       = useState(true)
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
@@ -136,8 +137,11 @@ export default function App() {
   const onConnect = useCallback(
     (params: Connection) =>
       setEdges(eds => {
+        // Treat a missing targetHandle as 'input' — all our single-port nodes use that id
+        const norm = (h: string | null | undefined) => h ?? 'input'
         const alreadyConnected = eds.some(
-          e => e.target === params.target && e.targetHandle === params.targetHandle,
+          e => e.target === params.target &&
+               norm(e.targetHandle) === norm(params.targetHandle),
         )
         if (alreadyConnected) return eds
         return addEdge({ ...params, animated: true, data: { flow_rate: 1.0 } }, eds)
@@ -484,12 +488,19 @@ export default function App() {
           </ReactFlow>
         </div>
 
-        <PropertiesPanel
-          selectedNode={selectedNode}
-          selectedEdge={selectedEdge}
-          onUpdateNode={updateNodeData}
-          onUpdateEdge={updateEdgeData}
-        />
+        {rightOpen ? (
+          <PropertiesPanel
+            selectedNode={selectedNode}
+            selectedEdge={selectedEdge}
+            onUpdateNode={updateNodeData}
+            onUpdateEdge={updateEdgeData}
+            onCollapse={() => setRightOpen(false)}
+          />
+        ) : (
+          <button className="sidebar-collapsed-tab" onClick={() => setRightOpen(true)} title="Show properties">
+            ‹ Properties
+          </button>
+        )}
       </div>
 
       {showResults && simResults && (

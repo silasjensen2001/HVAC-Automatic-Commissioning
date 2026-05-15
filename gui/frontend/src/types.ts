@@ -50,6 +50,7 @@ export interface FanData {
 export interface ExhaustData {
   label: string
   volume_flow_rate: number
+  flipHandles?: boolean
 }
 
 export interface EdgeData {
