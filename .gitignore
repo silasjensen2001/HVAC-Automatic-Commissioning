@@ -210,3 +210,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# GUI — Node / Vite (never commit these)
+gui/frontend/node_modules/
+gui/frontend/dist/
+gui/frontend/.vite/
