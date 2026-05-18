@@ -76,6 +76,11 @@ export interface ValveSeries {
   y: number[]
 }
 
+export interface HumiditySeries {
+  label: string
+  y: number[]   // specific humidity [kg_vapor / kg_dry_air]
+}
+
 export interface SteadyStateEntry {
   label: string
   temp_C: number
@@ -94,10 +99,23 @@ export interface SimMetrics {
   actuated_ids: string[]
 }
 
+export interface JunctionTimeSeries {
+  label:                      string
+  inlet_ids:                  string[]
+  inlet_labels:               string[]
+  flows:                      number[]
+  inlet_temperatures:         Record<string, number[]>   // °C
+  inlet_specific_humidities:  Record<string, number[]>   // kg/kg
+  outlet_temperatures:        number[]                   // °C
+  outlet_specific_humidities: number[]                   // kg/kg
+}
+
 export interface SimResults {
   t: number[]
-  outputs: Record<string, OutputSeries>
-  valves: Record<string, ValveSeries>
-  metrics: SimMetrics
+  outputs:  Record<string, OutputSeries>
+  valves:   Record<string, ValveSeries>
+  humidity: Record<string, HumiditySeries>          // inlet specific humidity per heat exchanger (nonlinear only)
+  junctions: Record<string, JunctionTimeSeries>     // mixing data per junction (nonlinear only)
+  metrics:  SimMetrics
   d_signal: number[]   // outdoor air temperature over time (°C)
 }

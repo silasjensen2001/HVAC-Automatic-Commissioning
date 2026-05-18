@@ -301,11 +301,57 @@ def run_simulation(rf_nodes: list, rf_edges: list, sim_params: dict) -> dict:
 
     d_signal = np.array([d_func(t_)[0] - 273.15 for t_ in sol.t])
 
+    # Compute inlet specific humidity and junction mixing time series (nonlinear only)
+    humidity  = {}
+    junctions = {}
+    if model_mode == "nonlinear":
+        hx_ids      = [n["id"] for n in hvac_nodes if n["type"] in ("cooler", "heater")]
+        junction_ids = [n["id"] for n in hvac_nodes if n["type"] == "junction"]
+
+        for aid in hx_ids:
+            humidity[aid] = {"label": id_to_label.get(aid, aid), "y": []}
+
+        # Initialise junction time series structure from first timestep
+        first_jdata = hvac.compute_junction_states(sol.y[:N, 0], float(d_func(sol.t[0])[0]))
+        for jid in junction_ids:
+            jd = first_jdata.get(jid, {})
+            inlets = jd.get("inputs", [])
+            junctions[jid] = {
+                "label":                    id_to_label.get(jid, jid),
+                "inlet_ids":                [src for src, _ in inlets],
+                "inlet_labels":             [id_to_label.get(src, src) for src, _ in inlets],
+                "flows":                    [float(flow) for _, flow in inlets],
+                "inlet_temperatures":       {src: [] for src, _ in inlets},
+                "inlet_specific_humidities":{src: [] for src, _ in inlets},
+                "outlet_temperatures":      [],
+                "outlet_specific_humidities": [],
+            }
+
+        for k in range(sol.y.shape[1]):
+            x_k   = sol.y[:N, k]
+            T_ext = float(d_func(sol.t[k])[0])
+
+            omegas = hvac.compute_inlet_specific_humidities(x_k, T_ext)
+            for aid in hx_ids:
+                humidity[aid]["y"].append(float(omegas.get(aid, 0.0)))
+
+            jdata = hvac.compute_junction_states(x_k, T_ext)
+            for jid in junction_ids:
+                jd  = jdata.get(jid, {})
+                jts = junctions[jid]
+                jts["outlet_temperatures"].append(float(jd.get("outlet_temperature", 0.0)) - 273.15)
+                jts["outlet_specific_humidities"].append(float(jd.get("outlet_specific_humidity", 0.0)))
+                for src in jts["inlet_ids"]:
+                    jts["inlet_temperatures"][src].append(float(jd.get("inlet_temperatures", {}).get(src, 0.0)) - 273.15)
+                    jts["inlet_specific_humidities"][src].append(float(jd.get("inlet_specific_humidities", {}).get(src, 0.0)))
+
     return {
         "t":        sol.t.tolist(),
         "d_signal": d_signal.tolist(),
         "outputs":  outputs,
-        "valves":  valves,
+        "valves":   valves,
+        "humidity":  humidity,
+        "junctions": junctions,
         "metrics": {
             "K_I":              ctrl.K_I.tolist(),
             "K_x":              ctrl.K_x.tolist(),

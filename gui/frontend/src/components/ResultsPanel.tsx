@@ -43,14 +43,14 @@ interface Props {
   onClose: () => void
 }
 
-type Tab = 'temperatures' | 'valves' | 'metrics'
+type Tab = 'temperatures' | 'valves' | 'humidity' | 'junctions' | 'metrics'
 
 export default function ResultsPanel({ results, onClose }: Props) {
   const [tab,       setTab]       = useState<Tab>('temperatures')
   const [collapsed, setCollapsed] = useState(false)
   const [height,    setHeight]    = useState(DEFAULT_HEIGHT)
 
-  const { t, outputs, valves, metrics, d_signal } = results
+  const { t, outputs, valves, humidity, junctions, metrics, d_signal } = results
 
   // Tell Plotly to re-fit after height or collapsed state changes
   useEffect(() => {
@@ -102,6 +102,27 @@ export default function ResultsPanel({ results, onClose }: Props) {
     name: series.label, line: { color: pickColor(series.label, i), width: 2 },
   }))
 
+  const junctionTempTraces = Object.entries(junctions ?? {}).map(([, jd]) => ({
+    x: t, y: jd.outlet_temperatures,
+    type: 'scatter' as const, mode: 'lines' as const,
+    name: `${jd.label} (mixed)`,
+    line: { color: '#f59e0b', width: 1.5, dash: 'dot' as const },
+  }))
+
+  const junctionHumidityTraces = Object.entries(junctions ?? {}).map(([, jd]) => ({
+    x: t, y: jd.outlet_specific_humidities,
+    type: 'scatter' as const, mode: 'lines' as const,
+    name: `${jd.label} (mixed)`,
+    line: { color: '#f59e0b', width: 1.5, dash: 'dot' as const },
+  }))
+
+  const humidityTraces = Object.entries(humidity ?? {}).map(([, series], i) => ({
+    x: t, y: series.y,
+    type: 'scatter' as const, mode: 'lines' as const,
+    name: `${series.label} inlet`,
+    line: { color: pickColor(series.label, i), width: 2 },
+  }))
+
   // ── Metrics ───────────────────────────────────────────────────────────────────
   const ssRows    = Object.values(metrics.steady_state)
   const KI        = metrics.K_I
@@ -136,7 +157,7 @@ export default function ResultsPanel({ results, onClose }: Props) {
 
       <div className="results-header">
         <div className="tab-bar">
-          {(['temperatures', 'valves', 'metrics'] as Tab[]).map(tabName => (
+          {(['temperatures', 'valves', 'humidity', 'junctions', 'metrics'] as Tab[]).map(tabName => (
             <button
               key={tabName}
               className={`tab-btn${tab === tabName ? ' tab-active' : ''}`}
@@ -192,6 +213,98 @@ export default function ResultsPanel({ results, onClose }: Props) {
               useResizeHandler
               config={{ responsive: true }}
             />
+          )}
+
+          {tab === 'humidity' && (
+            humidityTraces.length === 0
+              ? <div style={{ color: '#94a3b8', padding: 24 }}>Humidity data is only available in nonlinear mode.</div>
+              : <Plot
+                  data={humidityTraces}
+                  layout={{
+                    ...commonLayout,
+                    title: { text: 'Specific humidity at the inlet of each heat exchanger', font: { size: 13, color: '#94a3b8' } },
+                    margin: { ...commonLayout.margin, t: 48 },
+                    xaxis: { title: { text: 'Time (s)' },                          gridcolor: '#334155', zerolinecolor: '#475569' },
+                    yaxis: { title: { text: 'Specific humidity (kg/kg dry air)' },  gridcolor: '#334155', zerolinecolor: '#475569' },
+                  }}
+                  style={{ width: '100%', height: '100%' }}
+                  useResizeHandler
+                  config={{ responsive: true }}
+                />
+          )}
+
+          {tab === 'junctions' && (
+            Object.keys(junctions).length === 0
+              ? <div style={{ color: '#94a3b8', padding: 24 }}>Junction data is only available in nonlinear mode, and only when the graph contains junctions.</div>
+              : <div style={{ overflowY: 'auto', height: '100%', display: 'flex', flexDirection: 'column', gap: 16, padding: 8 }}>
+                  {Object.entries(junctions).map(([jid, jd]) => {
+                    const inletColorMap: Record<string, string> = {}
+                    jd.inlet_ids.forEach((src, i) => {
+                      inletColorMap[src] = pickColor(jd.inlet_labels[i], i)
+                    })
+                    const outletColor = '#f59e0b'
+
+                    const tempTraces = [
+                      ...jd.inlet_ids.map(src => ({
+                        x: t, y: jd.inlet_temperatures[src],
+                        type: 'scatter' as const, mode: 'lines' as const,
+                        name: jd.inlet_labels[jd.inlet_ids.indexOf(src)],
+                        line: { color: inletColorMap[src], width: 2 },
+                      })),
+                      { x: t, y: jd.outlet_temperatures,
+                        type: 'scatter' as const, mode: 'lines' as const,
+                        name: 'Mixed outlet',
+                        line: { color: outletColor, width: 2, dash: 'dash' as const } },
+                    ]
+
+                    const humTraces = [
+                      ...jd.inlet_ids.map(src => ({
+                        x: t, y: jd.inlet_specific_humidities[src],
+                        type: 'scatter' as const, mode: 'lines' as const,
+                        name: jd.inlet_labels[jd.inlet_ids.indexOf(src)],
+                        line: { color: inletColorMap[src], width: 2 },
+                        showlegend: false,
+                      })),
+                      { x: t, y: jd.outlet_specific_humidities,
+                        type: 'scatter' as const, mode: 'lines' as const,
+                        name: 'Mixed outlet',
+                        line: { color: outletColor, width: 2, dash: 'dash' as const },
+                        showlegend: false },
+                    ]
+
+                    return (
+                      <div key={jid}>
+                        <div style={{ color: '#e2e8f0', fontWeight: 600, marginBottom: 4, paddingLeft: 4 }}>
+                          Junction: {jd.label}
+                        </div>
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <Plot
+                            data={tempTraces}
+                            layout={{ ...commonLayout,
+                              margin: { t: 24, r: 12, b: 40, l: 60 },
+                              xaxis: { title: { text: 'Time (s)' },          gridcolor: '#334155', zerolinecolor: '#475569' },
+                              yaxis: { title: { text: 'Temperature (°C)' },  gridcolor: '#334155', zerolinecolor: '#475569' },
+                            }}
+                            style={{ flex: 1, height: 220 }}
+                            useResizeHandler
+                            config={{ responsive: true }}
+                          />
+                          <Plot
+                            data={humTraces}
+                            layout={{ ...commonLayout,
+                              margin: { t: 24, r: 12, b: 40, l: 60 },
+                              xaxis: { title: { text: 'Time (s)' },                         gridcolor: '#334155', zerolinecolor: '#475569' },
+                              yaxis: { title: { text: 'Specific humidity (kg/kg)' }, gridcolor: '#334155', zerolinecolor: '#475569' },
+                            }}
+                            style={{ flex: 1, height: 220 }}
+                            useResizeHandler
+                            config={{ responsive: true }}
+                          />
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
           )}
 
           {tab === 'metrics' && (
