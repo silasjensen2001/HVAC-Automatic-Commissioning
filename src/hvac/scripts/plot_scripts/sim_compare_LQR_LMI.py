@@ -44,15 +44,17 @@ params_heater = dict(
 model_mode = "nonlinear"  # "linear" or "nonlinear"
 
 compare_controllers = True
-use_lqr = False
 
-use_QR_tuning = False
-use_parallel_QR_tuning = False
-max_parallel_workers = 2
+use_lqr = False
+use_bryson_for_lqr = True
+
+use_QR_tuning = True
+use_parallel_QR_tuning = True
+max_parallel_workers = 20
 
 use_structured_QR_for_DR = True
 
-deadband_margin = 0.05  # [°C], acceptable temperature margin around reference
+deadband_margin = 0.00005  # [°C], acceptable temperature margin around reference
 metrics_ignore_fraction = 0.001  # Ignore first 0.1% of simulation when computing metrics
 
 
@@ -73,6 +75,29 @@ N = hvac.total_states   # 4K = 20
 
 
 # ── Structured Q/R helper ─────────────────────────────────────────────────────
+def structured_weight_values(
+    x_max_dev: float = 20.0,
+    xI_max: float = 10.0,
+    u_dev_max: float = 0.5,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
+):
+    """
+    Returns the actual scalar Qx, Qi, and R weights implied by the normalized
+    disturbance-rejection settings.
+
+        Qx = Qx_factor / x_max_dev²
+        Qi = Qi_factor / xI_max²
+        R  = R_factor  / u_dev_max²
+    """
+    Qx_weight = Qx_factor / x_max_dev**2
+    Qi_weight = Qi_factor / xI_max**2
+    R_weight  = R_factor  / u_dev_max**2
+
+    return Qx_weight, Qi_weight, R_weight
+
+
 def structured_cost_matrices(
     plant,
     x_max_dev: float = 20.0,
@@ -105,9 +130,14 @@ def structured_cost_matrices(
     m = plant.B_u.shape[1]
     p = plant.C.shape[0]
 
-    Qx_weight = Qx_factor / x_max_dev**2
-    Qi_weight = Qi_factor / xI_max**2
-    R_weight  = R_factor  / u_dev_max**2
+    Qx_weight, Qi_weight, R_weight = structured_weight_values(
+        x_max_dev=x_max_dev,
+        xI_max=xI_max,
+        u_dev_max=u_dev_max,
+        Qx_factor=Qx_factor,
+        Qi_factor=Qi_factor,
+        R_factor=R_factor,
+    )
 
     Q = np.block([
         [Qx_weight * np.eye(n), np.zeros((n, p))],
@@ -126,6 +156,17 @@ controller_qr_labels = {}
 Q_test_scale = 100
 R_test_scale = 10
 
+# ── Bryson settings for LQR ───────────────────────────────────────────────────
+# These are deviation-based limits because shifted=True is used below.
+lqr_x_max_dev = 20.0                 # [K], acceptable shifted-state deviation
+lqr_u_max     = np.array([0.5, 0.5]) # [-], acceptable valve command magnitude
+lqr_xI_max    = np.array([10.0, 10.0]) # [K·s], acceptable integrator magnitude
+
+# Actual scalar/diagonal Bryson weights used by LQR when use_bryson_for_lqr=True.
+lqr_Qx_weight = 1.0 / lqr_x_max_dev**2
+lqr_Qi_weights = 1.0 / lqr_xI_max**2
+lqr_R_weights = 1.0 / lqr_u_max**2
+
 # ── Normalized structured Q/R settings for disturbance rejection ──────────────
 # These are physical "acceptable maximum" values.
 # The factors below are dimensionless multipliers.
@@ -136,6 +177,16 @@ structured_u_dev_max = 0.5    # [-], acceptable valve deviation around u_offset 
 structured_Qx_factor = 1.0
 structured_Qi_factor = 1.0
 structured_R_factor  = 1.0
+
+# Actual scalar weights used by the structured LMI Q/R matrices.
+structured_Qx_weight, structured_Qi_weight, structured_R_weight = structured_weight_values(
+    x_max_dev=structured_x_max_dev,
+    xI_max=structured_xI_max,
+    u_dev_max=structured_u_dev_max,
+    Qx_factor=structured_Qx_factor,
+    Qi_factor=structured_Qi_factor,
+    R_factor=structured_R_factor,
+)
 
 if compare_controllers:
     if use_structured_QR_for_DR:
@@ -151,12 +202,13 @@ if compare_controllers:
 
         controller_qr_labels["Disturbance rejection"] = (
             f"DR normalized: "
-            f"x_max={structured_x_max_dev:g}, "
+            f"Qx={structured_Qx_weight:.6g}, "
+            f"Qi={structured_Qi_weight:.6g}, "
+            f"R={structured_R_weight:.6g} "
+            f"(from x_max={structured_x_max_dev:g}, "
             f"xI_max={structured_xI_max:g}, "
             f"u_dev_max={structured_u_dev_max:g}, "
-            f"Qx_fac={structured_Qx_factor:g}, "
-            f"Qi_fac={structured_Qi_factor:g}, "
-            f"R_fac={structured_R_factor:g}"
+            f"factors=[{structured_Qx_factor:g}, {structured_Qi_factor:g}, {structured_R_factor:g}])"
         )
     else:
         Q_dr, R_dr = StateFeedbackControllerDisturbanceRejection.cost_matrices(
@@ -171,16 +223,38 @@ if compare_controllers:
         hvac, Q=Q_dr, R=R_dr
     )
 
-    Q_lqr_scale = 10000
-    R_lqr_scale = 8
+    if use_bryson_for_lqr:
+        Q_lqr, R_lqr = StateFeedbackController.cost_bryson(
+            hvac,
+            x_max=np.full(N, lqr_x_max_dev),
+            u_max=lqr_u_max,
+            x_I_max=lqr_xI_max,
+            shifted=True,
+        )
 
-    Q_lqr, R_lqr = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale)
+        controller_qr_labels["LQR"] = (
+            f"LQR Bryson: "
+            f"Qx={lqr_Qx_weight:.6g}, "
+            f"Qi=[{lqr_Qi_weights[0]:.6g}, {lqr_Qi_weights[1]:.6g}], "
+            f"R=[{lqr_R_weights[0]:.6g}, {lqr_R_weights[1]:.6g}] "
+            f"(from x_max_dev={lqr_x_max_dev:g}, "
+            f"u_max=[{lqr_u_max[0]:g}, {lqr_u_max[1]:g}], "
+            f"xI_max=[{lqr_xI_max[0]:g}, {lqr_xI_max[1]:g}])"
+        )
+    else:
+        Q_lqr_scale = 10000
+        R_lqr_scale = 8
+
+        Q_lqr, R_lqr = StateFeedbackController.cost_matrices(
+            hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale
+        )
+
+        controller_qr_labels["LQR"] = (
+            f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
+        )
+
     controllers["LQR"] = StateFeedbackController.find_controller_gains(
         hvac, Q=Q_lqr, R=R_lqr
-    )
-
-    controller_qr_labels["LQR"] = (
-        f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
     )
 
 else:
@@ -217,19 +291,38 @@ else:
         controllers["Disturbance rejection"] = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
             hvac, Q=Q, R=R
         )
-    else:
-        Q_lqr_scale = 5
-        R_lqr_scale = 10
 
-        Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale)
+    else:
+        if use_bryson_for_lqr:
+            Q, R = StateFeedbackController.cost_bryson(
+                hvac,
+                x_max=np.full(N, lqr_x_max_dev),
+                u_max=lqr_u_max,
+                x_I_max=lqr_xI_max,
+                shifted=True,
+            )
+
+            controller_qr_labels["LQR"] = (
+                f"LQR Bryson: "
+                f"x_max_dev={lqr_x_max_dev:g}, "
+                f"u_max=[{lqr_u_max[0]:g}, {lqr_u_max[1]:g}], "
+                f"xI_max=[{lqr_xI_max[0]:g}, {lqr_xI_max[1]:g}]"
+            )
+        else:
+            Q_lqr_scale = 5
+            R_lqr_scale = 10
+
+            Q, R = StateFeedbackController.cost_matrices(
+                hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale
+            )
+
+            controller_qr_labels["LQR"] = (
+                f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
+            )
+
         controllers["LQR"] = StateFeedbackController.find_controller_gains(
             hvac, Q=Q, R=R
         )
-
-        controller_qr_labels["LQR"] = (
-            f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
-        )
-
 
 qr_info_text = " | ".join(controller_qr_labels.values())
 
@@ -254,7 +347,7 @@ t_day = 24 * 3600
 
 # ── Test case selector ────────────────────────────────────────────────────────
 # Options: "sinusoid", "weather_profile", "step", "stochastic", "constant"
-TEST_CASE = "constant"
+TEST_CASE = "weather_profile"
 
 
 # ── Disturbance definitions ───────────────────────────────────────────────────
@@ -293,8 +386,8 @@ def make_disturbance(test_case: str):
             T_in_sys = term1 + term2 + term3 + term4 + term5 + 273.15
             return np.array([T_in_sys])
 
-        t_end = 30#2 * t_day
-        n_eval = 5000
+        t_end = 2 * t_day
+        n_eval = 9 * t_day
         label = "Weather-like inlet disturbance with daily and multi-day harmonics"
         return d, t_end, n_eval, label
 
@@ -426,12 +519,12 @@ def deadband_error_metrics(t, y, reference, margin=0.02):
     error = y - reference
     excess_error = np.maximum(np.abs(error) - margin, 0.0)
 
-    deadband_iae = np.trapz(excess_error, t)
+    deadband_iae = np.trapezoid(excess_error, t)
     deadband_rms = np.sqrt(np.mean(excess_error**2))
     deadband_peak = np.max(excess_error)
 
     outside = excess_error > 0
-    time_outside = np.trapz(outside.astype(float), t)
+    time_outside = np.trapezoid(outside.astype(float), t)
     fraction_outside = time_outside / (t[-1] - t[0])
 
     return dict(
@@ -500,11 +593,11 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     sat_high = u >= u_max - tol
     saturated = sat_low | sat_high
 
-    saturation_time = np.trapz(saturated.astype(float), t)
+    saturation_time = np.trapezoid(saturated.astype(float), t)
     saturation_fraction = saturation_time / (t[-1] - t[0])
 
-    high_saturation_time = np.trapz(sat_high.astype(float), t)
-    low_saturation_time = np.trapz(sat_low.astype(float), t)
+    high_saturation_time = np.trapezoid(sat_high.astype(float), t)
+    low_saturation_time = np.trapezoid(sat_low.astype(float), t)
 
     high_saturation_fraction = high_saturation_time / (t[-1] - t[0])
     low_saturation_fraction = low_saturation_time / (t[-1] - t[0])
@@ -514,7 +607,7 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     du_dt = du / dt
 
     total_variation = np.sum(np.abs(du))
-    integrated_absolute_rate = np.trapz(np.abs(du_dt), t[:-1])
+    integrated_absolute_rate = np.trapezoid(np.abs(du_dt), t[:-1])
     rms_du_dt = np.sqrt(np.mean(du_dt**2))
     peak_du_dt = np.max(np.abs(du_dt))
 
@@ -554,7 +647,7 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=met
 
     peak_output_deviation = np.max(np.abs(y_dev))
     rms_output_deviation = np.sqrt(np.mean(y_dev**2))
-    iae = np.trapz(np.abs(y_dev), t[idx])
+    iae = np.trapezoid(np.abs(y_dev), t[idx])
 
     inlet_peak_to_peak = np.ptp(inlet[idx])
     output_peak_to_peak = np.ptp(y[idx])
@@ -641,13 +734,16 @@ def combined_metrics(result):
     #   4. avoid unnecessary valve motion
     #
     # Tune these coefficients depending on what matters most.
+    allowed_deadband_rms = 0.05          # [°C]
+    allowed_saturation_fraction = 0.05   # [-]
+    allowed_total_variation = 0.5        # [-]
+    allowed_rms_du_dt = 0.05              # [1/s]
+
     score = (
-        1.0  * deadband_rms
-        + 1.0 * deadband_iae / simulation_time
-        + 5.0  * fraction_outside
-        + 1.0 * saturation_fraction
-        + 10.0  * total_variation
-        + 1.0 * rms_du_dt
+        1.0 * deadband_rms / allowed_deadband_rms
+        + 1.0 * saturation_fraction / allowed_saturation_fraction
+        + 1.0 * total_variation / allowed_total_variation
+        + 1.0 * rms_du_dt / allowed_rms_du_dt
     )
 
     return dict(
@@ -774,9 +870,19 @@ for name, controller in controllers.items():
 
 # ── Optional Q/R sweep for disturbance-rejection controller ───────────────────
 def run_sweep_candidate(candidate_idx, Qx_factor, Qi_factor, R_factor):
+    Qx_weight, Qi_weight, R_weight = structured_weight_values(
+        x_max_dev=structured_x_max_dev,
+        xI_max=structured_xI_max,
+        u_dev_max=structured_u_dev_max,
+        Qx_factor=Qx_factor,
+        Qi_factor=Qi_factor,
+        R_factor=R_factor,
+    )
+
     candidate_name = (
         f"DR sweep {candidate_idx}: "
-        f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
+        f"Qx={Qx_weight:.6g}, Qi={Qi_weight:.6g}, R={R_weight:.6g} "
+        f"(factors: {Qx_factor}, {Qi_factor}, {R_factor})"
     )
 
     Q_sweep, R_sweep = structured_cost_matrices(
@@ -801,6 +907,9 @@ def run_sweep_candidate(candidate_idx, Qx_factor, Qi_factor, R_factor):
         Qx_factor=Qx_factor,
         Qi_factor=Qi_factor,
         R_factor=R_factor,
+        Qx_weight=Qx_weight,
+        Qi_weight=Qi_weight,
+        R_weight=R_weight,
         name=candidate_name,
         result=result_sweep,
         **combined,
@@ -830,6 +939,12 @@ if use_QR_tuning:
         f"x_max_dev={structured_x_max_dev:g}, "
         f"xI_max={structured_xI_max:g}, "
         f"u_dev_max={structured_u_dev_max:g}"
+    )
+    print(
+        f"Base weights: "
+        f"Qx={structured_Qx_weight:.6g}, "
+        f"Qi={structured_Qi_weight:.6g}, "
+        f"R={structured_R_weight:.6g}"
     )
 
     if use_parallel_QR_tuning:
@@ -885,9 +1000,10 @@ if use_QR_tuning:
         for item in sweep_records_sorted[:10]:
             print(
                 f"idx={item['candidate_idx']:>3}, "
-                f"Qx_fac={item['Qx_factor']:>6}, "
-                f"Qi_fac={item['Qi_factor']:>6}, "
-                f"R_fac={item['R_factor']:>6}, "
+                f"Qx={item['Qx_weight']:>10.6g}, "
+                f"Qi={item['Qi_weight']:>10.6g}, "
+                f"R={item['R_weight']:>10.6g}, "
+                f"fac=[{item['Qx_factor']:g}, {item['Qi_factor']:g}, {item['R_factor']:g}], "
                 f"score={item['score']:.6g}, "
                 f"deadband_rms={item['deadband_rms']:.6g}, "
                 f"frac_out={item['fraction_outside']:.6g}, "
@@ -1001,9 +1117,10 @@ if use_QR_tuning:
         ax_best[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
         ax_best[0].set_title(
             f"Best Normalized Q/R Sweep Candidate\n"
-            f"Qx_fac={best_sweep['Qx_factor']}, "
-            f"Qi_fac={best_sweep['Qi_factor']}, "
-            f"R_fac={best_sweep['R_factor']}",
+            f"Qx={best_sweep['Qx_weight']:.6g}, "
+            f"Qi={best_sweep['Qi_weight']:.6g}, "
+            f"R={best_sweep['R_weight']:.6g} "
+            f"(fac=[{best_sweep['Qx_factor']}, {best_sweep['Qi_factor']}, {best_sweep['R_factor']}])",
             fontweight="bold"
         )
         ax_best[0].set_ylabel("Temperature [°C]", fontweight="bold")
@@ -1097,6 +1214,18 @@ print(f"  {disturbance_label}")
 print(f"\n=== Controller Q/R settings ===")
 for name, label in controller_qr_labels.items():
     print(f"  {name}: {label}")
+
+print(f"\n=== Actual Q/R weight values ===")
+if "Disturbance rejection" in controllers:
+    print("  Disturbance rejection structured weights:")
+    print(f"    Qx weight: {structured_Qx_weight:.8g}")
+    print(f"    Qi weight: {structured_Qi_weight:.8g}")
+    print(f"    R weight:  {structured_R_weight:.8g}")
+if "LQR" in controllers and use_bryson_for_lqr:
+    print("  LQR Bryson weights:")
+    print(f"    Qx weight: {lqr_Qx_weight:.8g}")
+    print(f"    Qi weights: {lqr_Qi_weights}")
+    print(f"    R weights:  {lqr_R_weights}")
 
 for name, result in results.items():
     print(f"\n\n============================================================")
