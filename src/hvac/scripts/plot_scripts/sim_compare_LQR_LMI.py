@@ -18,8 +18,8 @@ params_cooler = dict(
     num_segments          = 5,
     num_pipes             = 10,
     gamma                 = 951.87,
-    cross_area_water      = 0.000201,
-    heat_exchanger_depth  = 0.06,
+    cross_area_water      = 0.000201*2,
+    heat_exchanger_depth  = 0.06*2,
     heat_exchanger_width  = 0.5,
     heat_exchanger_height = 0.5,
     volume_flow_wet_air   = 0.72634,
@@ -48,7 +48,7 @@ use_lqr = False
 
 use_QR_tuning = False
 use_parallel_QR_tuning = False
-max_parallel_workers = 20
+max_parallel_workers = 2
 
 use_structured_QR_for_DR = True
 
@@ -75,26 +75,39 @@ N = hvac.total_states   # 4K = 20
 # ── Structured Q/R helper ─────────────────────────────────────────────────────
 def structured_cost_matrices(
     plant,
-    Qx_weight: float = 1.0,
-    Qi_weight: float = 10.0,
-    R_weight: float = 1.0,
+    x_max_dev: float = 20.0,
+    xI_max: float = 10.0,
+    u_dev_max: float = 0.5,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
 ):
     """
-    Creates diagonal Q and R matrices using only:
-        Qx: penalty on plant states
-        Qi: penalty on integrator states
-        R:  penalty on valve/input usage
+    Creates diagonal Q and R matrices using the same structure as before:
 
-    Augmented state:
-        x_aug = [x, x_I]
-
-    Cost structure:
         Q = diag(Qx*I_n, Qi*I_p)
         R = R*I_m
+
+    but now Qx, Qi, and R are chosen using a Bryson-like normalization:
+
+        Qx = Qx_factor / x_max_dev²
+        Qi = Qi_factor / xI_max²
+        R  = R_factor  / u_dev_max²
+
+    Interpretation:
+        x_max_dev : acceptable shifted-state deviation [K]
+        xI_max    : acceptable integrator magnitude [K·s]
+        u_dev_max : acceptable valve deviation around the LMI input offset [-]
+
+    The factors are dimensionless tuning multipliers around the normalized values.
     """
     n = plant.A.shape[0]
     m = plant.B_u.shape[1]
     p = plant.C.shape[0]
+
+    Qx_weight = Qx_factor / x_max_dev**2
+    Qi_weight = Qi_factor / xI_max**2
+    R_weight  = R_factor  / u_dev_max**2
 
     Q = np.block([
         [Qx_weight * np.eye(n), np.zeros((n, p))],
@@ -113,23 +126,37 @@ controller_qr_labels = {}
 Q_test_scale = 100
 R_test_scale = 10
 
-structured_Qx_weight = 10.0
-structured_Qi_weight = 5.0
-structured_R_weight = 5.0
+# ── Normalized structured Q/R settings for disturbance rejection ──────────────
+# These are physical "acceptable maximum" values.
+# The factors below are dimensionless multipliers.
+structured_x_max_dev = 20.0   # [K], acceptable shifted-state deviation
+structured_xI_max    = 10.0   # [K·s], acceptable integrator magnitude
+structured_u_dev_max = 0.5    # [-], acceptable valve deviation around u_offset = 0.5
+
+structured_Qx_factor = 1.0
+structured_Qi_factor = 1.0
+structured_R_factor  = 1.0
 
 if compare_controllers:
     if use_structured_QR_for_DR:
         Q_dr, R_dr = structured_cost_matrices(
             hvac,
-            Qx_weight=structured_Qx_weight,
-            Qi_weight=structured_Qi_weight,
-            R_weight=structured_R_weight,
+            x_max_dev=structured_x_max_dev,
+            xI_max=structured_xI_max,
+            u_dev_max=structured_u_dev_max,
+            Qx_factor=structured_Qx_factor,
+            Qi_factor=structured_Qi_factor,
+            R_factor=structured_R_factor,
         )
 
         controller_qr_labels["Disturbance rejection"] = (
-            f"DR: Qx={structured_Qx_weight:g}, "
-            f"Qi={structured_Qi_weight:g}, "
-            f"R={structured_R_weight:g}"
+            f"DR normalized: "
+            f"x_max={structured_x_max_dev:g}, "
+            f"xI_max={structured_xI_max:g}, "
+            f"u_dev_max={structured_u_dev_max:g}, "
+            f"Qx_fac={structured_Qx_factor:g}, "
+            f"Qi_fac={structured_Qi_factor:g}, "
+            f"R_fac={structured_R_factor:g}"
         )
     else:
         Q_dr, R_dr = StateFeedbackControllerDisturbanceRejection.cost_matrices(
@@ -161,15 +188,22 @@ else:
         if use_structured_QR_for_DR:
             Q, R = structured_cost_matrices(
                 hvac,
-                Qx_weight=structured_Qx_weight,
-                Qi_weight=structured_Qi_weight,
-                R_weight=structured_R_weight,
+                x_max_dev=structured_x_max_dev,
+                xI_max=structured_xI_max,
+                u_dev_max=structured_u_dev_max,
+                Qx_factor=structured_Qx_factor,
+                Qi_factor=structured_Qi_factor,
+                R_factor=structured_R_factor,
             )
 
             controller_qr_labels["Disturbance rejection"] = (
-                f"DR: Qx={structured_Qx_weight:g}, "
-                f"Qi={structured_Qi_weight:g}, "
-                f"R={structured_R_weight:g}"
+                f"DR normalized: "
+                f"x_max={structured_x_max_dev:g}, "
+                f"xI_max={structured_xI_max:g}, "
+                f"u_dev_max={structured_u_dev_max:g}, "
+                f"Qx_fac={structured_Qx_factor:g}, "
+                f"Qi_fac={structured_Qi_factor:g}, "
+                f"R_fac={structured_R_factor:g}"
             )
         else:
             Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(
@@ -392,12 +426,12 @@ def deadband_error_metrics(t, y, reference, margin=0.02):
     error = y - reference
     excess_error = np.maximum(np.abs(error) - margin, 0.0)
 
-    deadband_iae = np.trapezoid(excess_error, t)
+    deadband_iae = np.trapz(excess_error, t)
     deadband_rms = np.sqrt(np.mean(excess_error**2))
     deadband_peak = np.max(excess_error)
 
     outside = excess_error > 0
-    time_outside = np.trapezoid(outside.astype(float), t)
+    time_outside = np.trapz(outside.astype(float), t)
     fraction_outside = time_outside / (t[-1] - t[0])
 
     return dict(
@@ -466,11 +500,11 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     sat_high = u >= u_max - tol
     saturated = sat_low | sat_high
 
-    saturation_time = np.trapezoid(saturated.astype(float), t)
+    saturation_time = np.trapz(saturated.astype(float), t)
     saturation_fraction = saturation_time / (t[-1] - t[0])
 
-    high_saturation_time = np.trapezoid(sat_high.astype(float), t)
-    low_saturation_time = np.trapezoid(sat_low.astype(float), t)
+    high_saturation_time = np.trapz(sat_high.astype(float), t)
+    low_saturation_time = np.trapz(sat_low.astype(float), t)
 
     high_saturation_fraction = high_saturation_time / (t[-1] - t[0])
     low_saturation_fraction = low_saturation_time / (t[-1] - t[0])
@@ -480,7 +514,7 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     du_dt = du / dt
 
     total_variation = np.sum(np.abs(du))
-    integrated_absolute_rate = np.trapezoid(np.abs(du_dt), t[:-1])
+    integrated_absolute_rate = np.trapz(np.abs(du_dt), t[:-1])
     rms_du_dt = np.sqrt(np.mean(du_dt**2))
     peak_du_dt = np.max(np.abs(du_dt))
 
@@ -520,7 +554,7 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=met
 
     peak_output_deviation = np.max(np.abs(y_dev))
     rms_output_deviation = np.sqrt(np.mean(y_dev**2))
-    iae = np.trapezoid(np.abs(y_dev), t[idx])
+    iae = np.trapz(np.abs(y_dev), t[idx])
 
     inlet_peak_to_peak = np.ptp(inlet[idx])
     output_peak_to_peak = np.ptp(y[idx])
@@ -606,7 +640,7 @@ def combined_metrics(result):
     #   3. avoid actuator saturation
     #   4. avoid unnecessary valve motion
     #
-    # You can tune these coefficients depending on what matters most.
+    # Tune these coefficients depending on what matters most.
     score = (
         1.0  * deadband_rms
         + 1.0 * deadband_iae / simulation_time
@@ -739,17 +773,20 @@ for name, controller in controllers.items():
 
 
 # ── Optional Q/R sweep for disturbance-rejection controller ───────────────────
-def run_sweep_candidate(candidate_idx, Qx_weight, Qi_weight, R_weight):
+def run_sweep_candidate(candidate_idx, Qx_factor, Qi_factor, R_factor):
     candidate_name = (
         f"DR sweep {candidate_idx}: "
-        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+        f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
     )
 
     Q_sweep, R_sweep = structured_cost_matrices(
         hvac,
-        Qx_weight=Qx_weight,
-        Qi_weight=Qi_weight,
-        R_weight=R_weight,
+        x_max_dev=structured_x_max_dev,
+        xI_max=structured_xI_max,
+        u_dev_max=structured_u_dev_max,
+        Qx_factor=Qx_factor,
+        Qi_factor=Qi_factor,
+        R_factor=R_factor,
     )
 
     controller_sweep = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
@@ -761,9 +798,9 @@ def run_sweep_candidate(candidate_idx, Qx_weight, Qi_weight, R_weight):
 
     return dict(
         candidate_idx=candidate_idx,
-        Qx_weight=Qx_weight,
-        Qi_weight=Qi_weight,
-        R_weight=R_weight,
+        Qx_factor=Qx_factor,
+        Qi_factor=Qi_factor,
+        R_factor=R_factor,
         name=candidate_name,
         result=result_sweep,
         **combined,
@@ -773,21 +810,27 @@ def run_sweep_candidate(candidate_idx, Qx_weight, Qi_weight, R_weight):
 sweep_records = []
 
 if use_QR_tuning:
-    Qx_weights = [1, 5, 10, 50, 100] #[100, 500, 1000, 2000, 10000]# [1, 3, 6, 7, 10] #[1, 5, 10, 50, 100]
-    Qi_weights = [1, 5, 10, 50, 100] #[100, 500, 1000, 2000, 10000] # [1, 3, 6, 7, 10] #[1, 5, 10, 50, 100]
-    R_weights =  [0.1, 0.5, 1, 5, 10]#[1.0, 5.0, 20.0, 50.0, 100.0] # [0.01, 0.05, 0.2, 0.5, 1.0] #[0.1, 0.5, 1, 5, 10]
+    Qx_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
+    Qi_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
+    R_factors  = [0.25, 0.5, 1.0, 2.0, 4.0]
 
     candidates = []
     candidate_idx = 0
 
-    for Qx_weight in Qx_weights:
-        for Qi_weight in Qi_weights:
-            for R_weight in R_weights:
+    for Qx_factor in Qx_factors:
+        for Qi_factor in Qi_factors:
+            for R_factor in R_factors:
                 candidate_idx += 1
-                candidates.append((candidate_idx, Qx_weight, Qi_weight, R_weight))
+                candidates.append((candidate_idx, Qx_factor, Qi_factor, R_factor))
 
-    print("\n=== Starting Q/R sweep for disturbance-rejection controller ===")
+    print("\n=== Starting normalized Q/R factor sweep for disturbance-rejection controller ===")
     print(f"Number of candidates: {len(candidates)}")
+    print(
+        f"Base normalization: "
+        f"x_max_dev={structured_x_max_dev:g}, "
+        f"xI_max={structured_xI_max:g}, "
+        f"u_dev_max={structured_u_dev_max:g}"
+    )
 
     if use_parallel_QR_tuning:
         print(f"Running sweep in parallel with max_workers={max_parallel_workers}")
@@ -800,27 +843,30 @@ if use_QR_tuning:
 
             for future in as_completed(future_to_candidate):
                 candidate = future_to_candidate[future]
-                idx, Qx_weight, Qi_weight, R_weight = candidate
+                idx, Qx_factor, Qi_factor, R_factor = candidate
 
                 try:
                     record = future.result()
                     sweep_records.append(record)
                     print(
                         f"Finished candidate {idx}: "
-                        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}, "
+                        f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}, "
                         f"score={record['score']:.6g}"
                     )
                 except Exception as exc:
                     print(
                         f"Candidate failed: idx={idx}, "
-                        f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+                        f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
                     )
                     print(f"Reason: {exc}")
 
     else:
         for candidate in candidates:
-            idx, Qx_weight, Qi_weight, R_weight = candidate
-            print(f"Synthesizing and simulating candidate {idx}: Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}")
+            idx, Qx_factor, Qi_factor, R_factor = candidate
+            print(
+                f"Synthesizing and simulating candidate {idx}: "
+                f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
+            )
 
             try:
                 record = run_sweep_candidate(*candidate)
@@ -828,20 +874,20 @@ if use_QR_tuning:
             except Exception as exc:
                 print(
                     f"Candidate failed: idx={idx}, "
-                    f"Qx={Qx_weight}, Qi={Qi_weight}, R={R_weight}"
+                    f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
                 )
                 print(f"Reason: {exc}")
 
     if len(sweep_records) > 0:
         sweep_records_sorted = sorted(sweep_records, key=lambda item: item["score"])
 
-        print("\n=== Best Q/R sweep candidates by score ===")
+        print("\n=== Best normalized Q/R factor sweep candidates by score ===")
         for item in sweep_records_sorted[:10]:
             print(
                 f"idx={item['candidate_idx']:>3}, "
-                f"Qx={item['Qx_weight']:>6}, "
-                f"Qi={item['Qi_weight']:>6}, "
-                f"R={item['R_weight']:>6}, "
+                f"Qx_fac={item['Qx_factor']:>6}, "
+                f"Qi_fac={item['Qi_factor']:>6}, "
+                f"R_fac={item['R_factor']:>6}, "
                 f"score={item['score']:.6g}, "
                 f"deadband_rms={item['deadband_rms']:.6g}, "
                 f"frac_out={item['fraction_outside']:.6g}, "
@@ -896,7 +942,7 @@ if use_QR_tuning:
         ax_sweep[5].grid(True, alpha=0.35)
 
         fig_sweep.suptitle(
-            f"Q/R tuning sweep — disturbance-rejection controller\n"
+            f"Normalized Q/R factor sweep — disturbance-rejection controller\n"
             f"Deadband margin = ±{deadband_margin:.3f} °C. Dashed line marks lowest-score candidate.",
             fontweight="bold"
         )
@@ -954,10 +1000,10 @@ if use_QR_tuning:
         ax_best[0].axhline(cooler_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Cooler ({cooler_ref_C:.1f} °C)")
         ax_best[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
         ax_best[0].set_title(
-            f"Best Q/R Sweep Candidate\n"
-            f"Qx={best_sweep['Qx_weight']}, "
-            f"Qi={best_sweep['Qi_weight']}, "
-            f"R={best_sweep['R_weight']}",
+            f"Best Normalized Q/R Sweep Candidate\n"
+            f"Qx_fac={best_sweep['Qx_factor']}, "
+            f"Qi_fac={best_sweep['Qi_factor']}, "
+            f"R_fac={best_sweep['R_factor']}",
             fontweight="bold"
         )
         ax_best[0].set_ylabel("Temperature [°C]", fontweight="bold")
@@ -1043,7 +1089,6 @@ cooler_ref_C = T1_ref - 273.15
 heater_ref_C = T2_ref - 273.15
 
 
-
 # ── Terminal summary ──────────────────────────────────────────────────────────
 print(f"\n=== Test case ===")
 print(f"  {TEST_CASE}")
@@ -1103,6 +1148,7 @@ for name, result in results.items():
         for key, value in result["step_metrics_heater"].items():
             print(f"  {key:<30}: {value:.6g}")
 
+
 # ── Compact controller comparison table ───────────────────────────────────────
 if compare_controllers and "Disturbance rejection" in results and "LQR" in results:
     print("\n\n============================================================")
@@ -1158,7 +1204,6 @@ if compare_controllers and "Disturbance rejection" in results and "LQR" in resul
                     better = "Equal"
 
             print(f"{key:<32} {val_lmi:>16.6g} {val_lqr:>16.6g} {better:>16}")
-
 
 
 # ── Comparison report plot: temperatures and valve inputs ─────────────────────
@@ -1326,5 +1371,3 @@ axes[5, 1].grid(True, alpha=0.35)
 plt.suptitle(f"HVAC cascade ({model_mode}): Cooler → Heater — {active_name}\n{controller_qr_labels[active_name]}", fontsize=13)
 plt.tight_layout()
 plt.show()
-
-

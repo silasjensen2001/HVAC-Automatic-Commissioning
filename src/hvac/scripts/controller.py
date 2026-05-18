@@ -6,6 +6,7 @@ import cvxpy as cp
 from scipy.io import loadmat
 from pathlib import Path
 
+
 class BaseStateFeedbackController(ABC):
     """Abstract base for state-feedback."""
 
@@ -14,7 +15,7 @@ class BaseStateFeedbackController(ABC):
         plant,
         K_x: np.ndarray,
         K_I: np.ndarray,
-        N: np.ndarray,
+        N: np.ndarray | None,
         M: np.ndarray,
         u_min: float = 0.0,
         u_max: float = 1.0,
@@ -50,10 +51,10 @@ class BaseStateFeedbackController(ABC):
         N = self.plant.total_states
 
         def ode(t, augmented_state):
-            x, x_I  = augmented_state[:N], augmented_state[N:]
+            x, x_I   = augmented_state[:N], augmented_state[N:]
             u_sat, _ = self.compute_input(x, x_I, r)
-            dx       = self.plant.derivatives(x, u_sat, d(t))
-            dx_I     = self.integrator_derivative(x, x_I, r)
+            dx        = self.plant.derivatives(x, u_sat, d(t))
+            dx_I      = self.integrator_derivative(x, x_I, r)
             return np.concatenate([dx, dx_I])
 
         return ode
@@ -95,7 +96,11 @@ class BaseStateFeedbackController(ABC):
         A_aug: np.ndarray, B_aug: np.ndarray, K_aug: np.ndarray, K_I: np.ndarray, alpha: float = 3.0
     ) -> np.ndarray:
         """Shared pole-placement anti-windup gain computation."""
-        p = K_I.shape[0]
+
+        # K_I has shape (n_inputs, n_integrators).
+        # The number of integrators equals the number of controlled outputs.
+        p = K_I.shape[1]
+
         eigs = np.linalg.eigvals(A_aug + B_aug @ K_aug)
         desired_poles = np.sort(eigs.real)[-p:] * alpha
         result = signal.place_poles(np.zeros((p, p)), K_I.T, desired_poles)
@@ -174,16 +179,17 @@ class StateFeedbackController(BaseStateFeedbackController):
         # Return the constructed controller instance
         return cls(plant, K_x, K_I, N, M, u_min=u_min, u_max=u_max)
 
+
 class StateFeedbackControllerDisturbanceRejection(BaseStateFeedbackController):
     """H∞ LMI-based state-feedback controller with disturbance rejection."""
 
-    def __init__(self, plant, K_x, K_I, N, M, u_min=0.0, u_max=1.0):
-        super().__init__(plant, K_x, K_I, N, M, u_min, u_max)
+    def __init__(self, plant, K_x, K_I, M, u_min=0.0, u_max=1.0):
+        # N is intentionally not used for the H∞/LMI disturbance-rejection controller.
+        super().__init__(plant, K_x, K_I, N=None, M=M, u_min=u_min, u_max=u_max)
         self.u_offset = 0.5 * (u_min + u_max)
 
     def raw_input(self, x: np.ndarray, x_I: np.ndarray, r: np.ndarray) -> np.ndarray:
-        z       = self.plant._to_shifted_frame(x)
-        r_shift = r - self.plant.C @ self.plant.coordinate_shift
+        z = self.plant._to_shifted_frame(x)
         return self.K_x @ z + self.K_I @ x_I
 
     def compute_input(self, x, x_I, r):
@@ -246,7 +252,6 @@ class StateFeedbackControllerDisturbanceRejection(BaseStateFeedbackController):
         K_aug = Y.value @ np.linalg.inv(P.value)
         K_x, K_I = K_aug[:, :n], K_aug[:, n:]
 
-        N = cls._steady_state_reference_gain(A, B_u, C, K_x)
         M = cls._compute_anti_windup_gain(A_aug, B_aug, K_aug, K_I)
 
-        return cls(plant=plant, K_x=K_x, K_I=K_I, N=N, M=M, u_min=u_min, u_max=u_max)
+        return cls(plant=plant, K_x=K_x, K_I=K_I, M=M, u_min=u_min, u_max=u_max)
