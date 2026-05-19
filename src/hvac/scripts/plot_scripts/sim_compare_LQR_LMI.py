@@ -44,7 +44,7 @@ t_day = 24 * 3600
 # ── Bryson tuning limits ──────────────────────────────────────────────────────
 air_temp_max_error = 1.0     # [K]
 water_temp_max_error = 50.0  # [K]
-wanted_settling_time = 2.0   # [s]
+wanted_settling_time = 5.0   # [s]
 
 
 # ── Manual Q/R settings ───────────────────────────────────────────────────────
@@ -256,8 +256,8 @@ def make_disturbance(test_case: str):
             T_in_sys = term1 + term2 + term3 + term4 + term5 + 273.15
             return np.array([T_in_sys])
 
-        t_end = 30 #2 * t_day
-        n_eval = 3000 #9 * t_day
+        t_end = 2 * t_day
+        n_eval = 10 * t_day
         label = "Weather-like inlet disturbance with daily and multi-day harmonics"
         return d, t_end, n_eval, label
 
