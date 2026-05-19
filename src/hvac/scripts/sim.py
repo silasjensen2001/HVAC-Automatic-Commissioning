@@ -51,19 +51,33 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Toggles ───────────────────────────────────────────────────────────────────
-COMPARE_CONTROLLERS       = True   # True: overlay both in one 2×1 layout
-USE_DISTURBANCE_REJECTION = True   # Used when COMPARE_CONTROLLERS = False
-USE_BRYSON                = False  # Only used for LQR (not compatible with LMI design)
+COMPARE_CONTROLLERS       = False   # True: overlay both in one 2×1 layout
+USE_DISTURBANCE_REJECTION = False   # Used when COMPARE_CONTROLLERS = False
+USE_BRYSON                = True   # Only used for LQR (not compatible with LMI design)
 CASE_DISTURBANCE          = 0      # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined
-
-# ── Bryson bounds ─────────────────────────────────────────────────────────────
-x_max  = np.full(20, 20 + 273.15)
-u_max  = np.array([0.5, 0.5])
-xI_max = np.array([10.0, 10.0])
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
 N = hvac.total_states
+
+# ── Bryson bounds ─────────────────────────────────────────────────────────────
+air_temp_max_error = 2.0    # [K]
+water_temp_max_error = 50.0 # [K]
+wanted_settling_time = 5.0 # [s]
+
+# Air states (first K and K+1:2K): air_temp_max_error
+# Water states (2K:3K and 3K:4K): water_temp_max_error
+x_max = np.concatenate([
+    np.full(K, air_temp_max_error),
+    np.full(K, air_temp_max_error),
+    np.full(K, water_temp_max_error),
+    np.full(K, water_temp_max_error),
+])
+
+# Integral states: air_temp_max_error * wanted_settling_time
+xI_max = np.full(2, air_temp_max_error * wanted_settling_time)
+
+u_max  = np.array([1.0, 1.0])
 
 # ── Time ──────────────────────────────────────────────────────────────────────
 t_day          = 24 * 3600
@@ -136,7 +150,7 @@ def build_and_simulate(use_disturbance_rejection):
     if use_disturbance_rejection:
         Q, R = ControllerCls.cost_matrices(hvac, Q_scale=10.0, Qi_scale=5.0, R_scale=5.0, use_disturbance_rejection=True)
     else:
-        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max)
+        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max, shifted=False)
                 if USE_BRYSON else
                 ControllerCls.cost_matrices(hvac, Q_scale=10000.0, R_scale=8.0))
     ctrl = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
