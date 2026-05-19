@@ -12,7 +12,57 @@ from models import HVAC
 from controller import StateFeedbackControllerDisturbanceRejection, StateFeedbackController
 
 
-# ── Parameters ────────────────────────────────────────────────────────────────
+# ── Main run configuration ────────────────────────────────────────────────────
+model_mode = "nonlinear"  # "linear" or "nonlinear"
+
+RUN_MODE = "compare"  # "compare", "lqr_only", "lmi_only"
+
+LQR_TUNING_MODE = "bryson"  # "manual", "bryson", "bryson_sweep"
+LMI_TUNING_MODE = "bryson"  # "manual", "bryson", "bryson_sweep"
+
+# Options: "sinusoid", "weather_profile", "step", "stochastic", "constant"
+TEST_CASE = "weather_profile"
+
+
+# ── Sweep and simulation settings ─────────────────────────────────────────────
+USE_PARALLEL_SWEEP = True
+MAX_PARALLEL_WORKERS = 2
+
+deadband_margin = 0.0005        # [°C], acceptable temperature margin around reference
+metrics_ignore_fraction = 0.001 # Ignore first 0.1% of simulation when computing metrics
+
+
+# ── References and disturbance base values ────────────────────────────────────
+T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
+T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
+r      = np.array([T1_ref, T2_ref])
+
+T_in  = 23 + 273.15
+t_day = 24 * 3600
+
+
+# ── Bryson tuning limits ──────────────────────────────────────────────────────
+air_temp_max_error = 1.0     # [K]
+water_temp_max_error = 50.0  # [K]
+wanted_settling_time = 2.0   # [s]
+
+
+# ── Manual Q/R settings ───────────────────────────────────────────────────────
+# Used only when LQR_TUNING_MODE or LMI_TUNING_MODE is set to "manual".
+LQR_MANUAL_Q_SCALE = 10000
+LQR_MANUAL_R_SCALE = 8
+
+LMI_MANUAL_Q_SCALE = 100
+LMI_MANUAL_R_SCALE = 10
+
+
+# ── Sweep factor grid ─────────────────────────────────────────────────────────
+Qx_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
+Qi_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
+R_factors  = [0.25, 0.5, 1.0, 2.0, 4.0]
+
+
+# ── Plant parameters ──────────────────────────────────────────────────────────
 params_cooler = dict(
     type                  = "cooler",
     num_segments          = 5,
@@ -41,22 +91,6 @@ params_heater = dict(
     Kvs                   = 1.6471,
 )
 
-model_mode = "nonlinear"  # "linear" or "nonlinear"
-
-compare_controllers = True
-
-use_lqr = False
-use_bryson_for_lqr = True
-
-use_QR_tuning = True
-use_parallel_QR_tuning = True
-max_parallel_workers = 20
-
-use_structured_QR_for_DR = True
-
-deadband_margin = 0.00005  # [°C], acceptable temperature margin around reference
-metrics_ignore_fraction = 0.001  # Ignore first 0.1% of simulation when computing metrics
-
 
 # ── Instantiate plant ─────────────────────────────────────────────────────────
 #hvac = HVAC(configs=[params_cooler, params_heater], mode=model_mode, const_disturbance=28 + 273.15)
@@ -74,257 +108,27 @@ K = hvac._lin_components[0].K
 N = hvac.total_states   # 4K = 20
 
 
-# ── Structured Q/R helper ─────────────────────────────────────────────────────
-def structured_weight_values(
-    x_max_dev: float = 20.0,
-    xI_max: float = 10.0,
-    u_dev_max: float = 0.5,
-    Qx_factor: float = 1.0,
-    Qi_factor: float = 1.0,
-    R_factor: float = 1.0,
-):
-    """
-    Returns the actual scalar Qx, Qi, and R weights implied by the normalized
-    disturbance-rejection settings.
+# ── Bryson bounds ─────────────────────────────────────────────────────────────
+# State ordering in the simulation:
+#   0:K       cooler air
+#   K:2K      cooler water
+#   2K:3K     heater air
+#   3K:4K     heater water
+#
+# Therefore the correct limit ordering is:
+#   [air, water, air, water]
+x_max = np.concatenate([
+    np.full(K, air_temp_max_error),
+    np.full(K, water_temp_max_error),
+    np.full(K, air_temp_max_error),
+    np.full(K, water_temp_max_error),
+])
 
-        Qx = Qx_factor / x_max_dev²
-        Qi = Qi_factor / xI_max²
-        R  = R_factor  / u_dev_max²
-    """
-    Qx_weight = Qx_factor / x_max_dev**2
-    Qi_weight = Qi_factor / xI_max**2
-    R_weight  = R_factor  / u_dev_max**2
+# Integral states: air temperature error accumulated over a desired time scale
+xI_max = np.full(2, air_temp_max_error * wanted_settling_time)
 
-    return Qx_weight, Qi_weight, R_weight
-
-
-def structured_cost_matrices(
-    plant,
-    x_max_dev: float = 20.0,
-    xI_max: float = 10.0,
-    u_dev_max: float = 0.5,
-    Qx_factor: float = 1.0,
-    Qi_factor: float = 1.0,
-    R_factor: float = 1.0,
-):
-    """
-    Creates diagonal Q and R matrices using the same structure as before:
-
-        Q = diag(Qx*I_n, Qi*I_p)
-        R = R*I_m
-
-    but now Qx, Qi, and R are chosen using a Bryson-like normalization:
-
-        Qx = Qx_factor / x_max_dev²
-        Qi = Qi_factor / xI_max²
-        R  = R_factor  / u_dev_max²
-
-    Interpretation:
-        x_max_dev : acceptable shifted-state deviation [K]
-        xI_max    : acceptable integrator magnitude [K·s]
-        u_dev_max : acceptable valve deviation around the LMI input offset [-]
-
-    The factors are dimensionless tuning multipliers around the normalized values.
-    """
-    n = plant.A.shape[0]
-    m = plant.B_u.shape[1]
-    p = plant.C.shape[0]
-
-    Qx_weight, Qi_weight, R_weight = structured_weight_values(
-        x_max_dev=x_max_dev,
-        xI_max=xI_max,
-        u_dev_max=u_dev_max,
-        Qx_factor=Qx_factor,
-        Qi_factor=Qi_factor,
-        R_factor=R_factor,
-    )
-
-    Q = np.block([
-        [Qx_weight * np.eye(n), np.zeros((n, p))],
-        [np.zeros((p, n)),      Qi_weight * np.eye(p)]
-    ])
-
-    R = R_weight * np.eye(m)
-
-    return Q, R
-
-
-# ── Instantiate controller(s) ─────────────────────────────────────────────────
-controllers = {}
-controller_qr_labels = {}
-
-Q_test_scale = 100
-R_test_scale = 10
-
-# ── Bryson settings for LQR ───────────────────────────────────────────────────
-# These are deviation-based limits because shifted=True is used below.
-lqr_x_max_dev = 20.0                 # [K], acceptable shifted-state deviation
-lqr_u_max     = np.array([0.5, 0.5]) # [-], acceptable valve command magnitude
-lqr_xI_max    = np.array([10.0, 10.0]) # [K·s], acceptable integrator magnitude
-
-# Actual scalar/diagonal Bryson weights used by LQR when use_bryson_for_lqr=True.
-lqr_Qx_weight = 1.0 / lqr_x_max_dev**2
-lqr_Qi_weights = 1.0 / lqr_xI_max**2
-lqr_R_weights = 1.0 / lqr_u_max**2
-
-# ── Normalized structured Q/R settings for disturbance rejection ──────────────
-# These are physical "acceptable maximum" values.
-# The factors below are dimensionless multipliers.
-structured_x_max_dev = 20.0   # [K], acceptable shifted-state deviation
-structured_xI_max    = 10.0   # [K·s], acceptable integrator magnitude
-structured_u_dev_max = 0.5    # [-], acceptable valve deviation around u_offset = 0.5
-
-structured_Qx_factor = 1.0
-structured_Qi_factor = 1.0
-structured_R_factor  = 1.0
-
-# Actual scalar weights used by the structured LMI Q/R matrices.
-structured_Qx_weight, structured_Qi_weight, structured_R_weight = structured_weight_values(
-    x_max_dev=structured_x_max_dev,
-    xI_max=structured_xI_max,
-    u_dev_max=structured_u_dev_max,
-    Qx_factor=structured_Qx_factor,
-    Qi_factor=structured_Qi_factor,
-    R_factor=structured_R_factor,
-)
-
-if compare_controllers:
-    if use_structured_QR_for_DR:
-        Q_dr, R_dr = structured_cost_matrices(
-            hvac,
-            x_max_dev=structured_x_max_dev,
-            xI_max=structured_xI_max,
-            u_dev_max=structured_u_dev_max,
-            Qx_factor=structured_Qx_factor,
-            Qi_factor=structured_Qi_factor,
-            R_factor=structured_R_factor,
-        )
-
-        controller_qr_labels["Disturbance rejection"] = (
-            f"DR normalized: "
-            f"Qx={structured_Qx_weight:.6g}, "
-            f"Qi={structured_Qi_weight:.6g}, "
-            f"R={structured_R_weight:.6g} "
-            f"(from x_max={structured_x_max_dev:g}, "
-            f"xI_max={structured_xI_max:g}, "
-            f"u_dev_max={structured_u_dev_max:g}, "
-            f"factors=[{structured_Qx_factor:g}, {structured_Qi_factor:g}, {structured_R_factor:g}])"
-        )
-    else:
-        Q_dr, R_dr = StateFeedbackControllerDisturbanceRejection.cost_matrices(
-            hvac, Q_scale=Q_test_scale, R_scale=R_test_scale
-        )
-
-        controller_qr_labels["Disturbance rejection"] = (
-            f"DR: Qscale={Q_test_scale:g}, Rscale={R_test_scale:g}"
-        )
-
-    controllers["Disturbance rejection"] = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
-        hvac, Q=Q_dr, R=R_dr
-    )
-
-    if use_bryson_for_lqr:
-        Q_lqr, R_lqr = StateFeedbackController.cost_bryson(
-            hvac,
-            x_max=np.full(N, lqr_x_max_dev),
-            u_max=lqr_u_max,
-            x_I_max=lqr_xI_max,
-            shifted=True,
-        )
-
-        controller_qr_labels["LQR"] = (
-            f"LQR Bryson: "
-            f"Qx={lqr_Qx_weight:.6g}, "
-            f"Qi=[{lqr_Qi_weights[0]:.6g}, {lqr_Qi_weights[1]:.6g}], "
-            f"R=[{lqr_R_weights[0]:.6g}, {lqr_R_weights[1]:.6g}] "
-            f"(from x_max_dev={lqr_x_max_dev:g}, "
-            f"u_max=[{lqr_u_max[0]:g}, {lqr_u_max[1]:g}], "
-            f"xI_max=[{lqr_xI_max[0]:g}, {lqr_xI_max[1]:g}])"
-        )
-    else:
-        Q_lqr_scale = 10000
-        R_lqr_scale = 8
-
-        Q_lqr, R_lqr = StateFeedbackController.cost_matrices(
-            hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale
-        )
-
-        controller_qr_labels["LQR"] = (
-            f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
-        )
-
-    controllers["LQR"] = StateFeedbackController.find_controller_gains(
-        hvac, Q=Q_lqr, R=R_lqr
-    )
-
-else:
-    if not use_lqr:
-        if use_structured_QR_for_DR:
-            Q, R = structured_cost_matrices(
-                hvac,
-                x_max_dev=structured_x_max_dev,
-                xI_max=structured_xI_max,
-                u_dev_max=structured_u_dev_max,
-                Qx_factor=structured_Qx_factor,
-                Qi_factor=structured_Qi_factor,
-                R_factor=structured_R_factor,
-            )
-
-            controller_qr_labels["Disturbance rejection"] = (
-                f"DR normalized: "
-                f"x_max={structured_x_max_dev:g}, "
-                f"xI_max={structured_xI_max:g}, "
-                f"u_dev_max={structured_u_dev_max:g}, "
-                f"Qx_fac={structured_Qx_factor:g}, "
-                f"Qi_fac={structured_Qi_factor:g}, "
-                f"R_fac={structured_R_factor:g}"
-            )
-        else:
-            Q, R = StateFeedbackControllerDisturbanceRejection.cost_matrices(
-                hvac, Q_scale=Q_test_scale, R_scale=R_test_scale
-            )
-
-            controller_qr_labels["Disturbance rejection"] = (
-                f"DR: Qscale={Q_test_scale:g}, Rscale={R_test_scale:g}"
-            )
-
-        controllers["Disturbance rejection"] = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
-            hvac, Q=Q, R=R
-        )
-
-    else:
-        if use_bryson_for_lqr:
-            Q, R = StateFeedbackController.cost_bryson(
-                hvac,
-                x_max=np.full(N, lqr_x_max_dev),
-                u_max=lqr_u_max,
-                x_I_max=lqr_xI_max,
-                shifted=True,
-            )
-
-            controller_qr_labels["LQR"] = (
-                f"LQR Bryson: "
-                f"x_max_dev={lqr_x_max_dev:g}, "
-                f"u_max=[{lqr_u_max[0]:g}, {lqr_u_max[1]:g}], "
-                f"xI_max=[{lqr_xI_max[0]:g}, {lqr_xI_max[1]:g}]"
-            )
-        else:
-            Q_lqr_scale = 5
-            R_lqr_scale = 10
-
-            Q, R = StateFeedbackController.cost_matrices(
-                hvac, Q_scale=Q_lqr_scale, R_scale=R_lqr_scale
-            )
-
-            controller_qr_labels["LQR"] = (
-                f"LQR: Qscale={Q_lqr_scale:g}, Rscale={R_lqr_scale:g}"
-            )
-
-        controllers["LQR"] = StateFeedbackController.find_controller_gains(
-            hvac, Q=Q, R=R
-        )
-
-qr_info_text = " | ".join(controller_qr_labels.values())
+# Input weighting limit
+u_max = np.array([1.0, 1.0])
 
 
 # ── Initial conditions ────────────────────────────────────────────────────────
@@ -336,18 +140,84 @@ x0 = np.concatenate([
 ])
 
 
-# ── References ────────────────────────────────────────────────────────────────
-T1_ref = 10.0 + 273.15   # Cooler air outlet setpoint [K]
-T2_ref = 20.0 + 273.15   # Heater air outlet setpoint [K]
-r      = np.array([T1_ref, T2_ref])
+# ── Bryson Q/R helper ─────────────────────────────────────────────────────────
+def bryson_weight_values(
+    x_max_dev: np.ndarray,
+    xI_max: np.ndarray,
+    u_max: np.ndarray,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
+):
+    """
+    Returns the actual diagonal Qx, Qi, and R weights implied by Bryson-style
+    normalization with optional dimensionless tuning factors.
 
-T_in = 23 + 273.15
-t_day = 24 * 3600
+        Qx_i = Qx_factor / x_max_dev_i²
+        Qi_i = Qi_factor / xI_max_i²
+        R_i  = R_factor  / u_max_i²
+
+    Pure Bryson corresponds to all factors being 1.
+    """
+    x_max_dev = np.asarray(x_max_dev, dtype=float)
+    xI_max = np.asarray(xI_max, dtype=float)
+    u_max = np.asarray(u_max, dtype=float)
+
+    Qx_weights = Qx_factor / x_max_dev**2
+    Qi_weights = Qi_factor / xI_max**2
+    R_weights  = R_factor  / u_max**2
+
+    return Qx_weights, Qi_weights, R_weights
 
 
-# ── Test case selector ────────────────────────────────────────────────────────
-# Options: "sinusoid", "weather_profile", "step", "stochastic", "constant"
-TEST_CASE = "weather_profile"
+def bryson_cost_matrices(
+    plant,
+    x_max_dev: np.ndarray,
+    xI_max: np.ndarray,
+    u_max: np.ndarray,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
+):
+    """
+    Creates diagonal Q and R matrices using Bryson-style normalized limits.
+
+    Augmented state:
+        x_aug = [x, x_I]
+
+    Cost structure:
+        Q = diag(Qx_1, ..., Qx_n, Qi_1, ..., Qi_p)
+        R = diag(R_1, ..., R_m)
+
+    where:
+        Qx_i = Qx_factor / x_max_dev_i²
+        Qi_i = Qi_factor / xI_max_i²
+        R_i  = R_factor  / u_max_i²
+    """
+    n = plant.A.shape[0]
+    m = plant.B_u.shape[1]
+    p = plant.C.shape[0]
+
+    Qx_weights, Qi_weights, R_weights = bryson_weight_values(
+        x_max_dev=x_max_dev,
+        xI_max=xI_max,
+        u_max=u_max,
+        Qx_factor=Qx_factor,
+        Qi_factor=Qi_factor,
+        R_factor=R_factor,
+    )
+
+    if len(Qx_weights) != n:
+        raise ValueError(f"x_max_dev must have length {n}, got {len(Qx_weights)}.")
+    if len(Qi_weights) != p:
+        raise ValueError(f"xI_max must have length {p}, got {len(Qi_weights)}.")
+    if len(R_weights) != m:
+        raise ValueError(f"u_max must have length {m}, got {len(R_weights)}.")
+
+    Q = np.diag(np.concatenate([Qx_weights, Qi_weights]))
+    R = np.diag(R_weights)
+
+    return Q, R
 
 
 # ── Disturbance definitions ───────────────────────────────────────────────────
@@ -386,8 +256,8 @@ def make_disturbance(test_case: str):
             T_in_sys = term1 + term2 + term3 + term4 + term5 + 273.15
             return np.array([T_in_sys])
 
-        t_end = 2 * t_day
-        n_eval = 9 * t_day
+        t_end = 30 #2 * t_day
+        n_eval = 3000 #9 * t_day
         label = "Weather-like inlet disturbance with daily and multi-day harmonics"
         return d, t_end, n_eval, label
 
@@ -519,12 +389,12 @@ def deadband_error_metrics(t, y, reference, margin=0.02):
     error = y - reference
     excess_error = np.maximum(np.abs(error) - margin, 0.0)
 
-    deadband_iae = np.trapezoid(excess_error, t)
+    deadband_iae = np.trapz(excess_error, t)
     deadband_rms = np.sqrt(np.mean(excess_error**2))
     deadband_peak = np.max(excess_error)
 
     outside = excess_error > 0
-    time_outside = np.trapezoid(outside.astype(float), t)
+    time_outside = np.trapz(outside.astype(float), t)
     fraction_outside = time_outside / (t[-1] - t[0])
 
     return dict(
@@ -593,11 +463,11 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     sat_high = u >= u_max - tol
     saturated = sat_low | sat_high
 
-    saturation_time = np.trapezoid(saturated.astype(float), t)
+    saturation_time = np.trapz(saturated.astype(float), t)
     saturation_fraction = saturation_time / (t[-1] - t[0])
 
-    high_saturation_time = np.trapezoid(sat_high.astype(float), t)
-    low_saturation_time = np.trapezoid(sat_low.astype(float), t)
+    high_saturation_time = np.trapz(sat_high.astype(float), t)
+    low_saturation_time = np.trapz(sat_low.astype(float), t)
 
     high_saturation_fraction = high_saturation_time / (t[-1] - t[0])
     low_saturation_fraction = low_saturation_time / (t[-1] - t[0])
@@ -607,7 +477,7 @@ def actuator_metrics(t, u, u_min=0.0, u_max=1.0, tol=1e-6):
     du_dt = du / dt
 
     total_variation = np.sum(np.abs(du))
-    integrated_absolute_rate = np.trapezoid(np.abs(du_dt), t[:-1])
+    integrated_absolute_rate = np.trapz(np.abs(du_dt), t[:-1])
     rms_du_dt = np.sqrt(np.mean(du_dt**2))
     peak_du_dt = np.max(np.abs(du_dt))
 
@@ -647,7 +517,7 @@ def disturbance_rejection_metrics(t, y, reference, inlet, u, ignore_fraction=met
 
     peak_output_deviation = np.max(np.abs(y_dev))
     rms_output_deviation = np.sqrt(np.mean(y_dev**2))
-    iae = np.trapezoid(np.abs(y_dev), t[idx])
+    iae = np.trapz(np.abs(y_dev), t[idx])
 
     inlet_peak_to_peak = np.ptp(inlet[idx])
     output_peak_to_peak = np.ptp(y[idx])
@@ -725,19 +595,16 @@ def combined_metrics(result):
     rms_du_dt = max(mc["rms_du_dt"], mh["rms_du_dt"])
     peak_du_dt = max(mc["peak_du_dt"], mh["peak_du_dt"])
 
-    simulation_time = result["sol"].t[-1] - result["sol"].t[0]
-
     # Score philosophy:
     #   1. stay inside the acceptable temperature band
-    #   2. minimize time outside the band
-    #   3. avoid actuator saturation
-    #   4. avoid unnecessary valve motion
+    #   2. avoid actuator saturation
+    #   3. avoid unnecessary valve motion
     #
-    # Tune these coefficients depending on what matters most.
+    # The score is normalized by allowed metric values, so each term is dimensionless.
     allowed_deadband_rms = 0.05          # [°C]
     allowed_saturation_fraction = 0.05   # [-]
     allowed_total_variation = 0.5        # [-]
-    allowed_rms_du_dt = 0.05              # [1/s]
+    allowed_rms_du_dt = 0.05             # [1/s]
 
     score = (
         1.0 * deadband_rms / allowed_deadband_rms
@@ -860,69 +727,167 @@ def simulate_controller(controller, name):
     )
 
 
-# ── Simulate selected controller(s) ───────────────────────────────────────────
-results = {}
+# ── Controller synthesis helpers ──────────────────────────────────────────────
+def selected_controller_names(run_mode: str):
+    if run_mode == "compare":
+        return ["Disturbance rejection", "LQR"]
+    if run_mode == "lqr_only":
+        return ["LQR"]
+    if run_mode == "lmi_only":
+        return ["Disturbance rejection"]
 
-for name, controller in controllers.items():
-    print(f"Simulating controller: {name}")
-    results[name] = simulate_controller(controller, name)
+    raise ValueError("RUN_MODE must be 'compare', 'lqr_only', or 'lmi_only'.")
 
 
-# ── Optional Q/R sweep for disturbance-rejection controller ───────────────────
-def run_sweep_candidate(candidate_idx, Qx_factor, Qi_factor, R_factor):
-    Qx_weight, Qi_weight, R_weight = structured_weight_values(
-        x_max_dev=structured_x_max_dev,
-        xI_max=structured_xI_max,
-        u_dev_max=structured_u_dev_max,
+def controller_tuning_mode(controller_name: str):
+    if controller_name == "LQR":
+        return LQR_TUNING_MODE
+    if controller_name == "Disturbance rejection":
+        return LMI_TUNING_MODE
+
+    raise ValueError(f"Unknown controller name: {controller_name}")
+
+
+def validate_tuning_mode(tuning_mode: str):
+    valid_modes = ["manual", "bryson", "bryson_sweep"]
+    if tuning_mode not in valid_modes:
+        raise ValueError(f"Tuning mode must be one of {valid_modes}, got '{tuning_mode}'.")
+
+
+def build_controller(controller_name: str, Q: np.ndarray, R: np.ndarray):
+    if controller_name == "LQR":
+        return StateFeedbackController.find_controller_gains(hvac, Q=Q, R=R)
+
+    if controller_name == "Disturbance rejection":
+        return StateFeedbackControllerDisturbanceRejection.find_controller_gains(hvac, Q=Q, R=R)
+
+    raise ValueError(f"Unknown controller name: {controller_name}")
+
+
+def make_cost_matrices_for_controller(
+    controller_name: str,
+    tuning_mode: str,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
+):
+    if tuning_mode == "manual":
+        if controller_name == "LQR":
+            return StateFeedbackController.cost_matrices(
+                hvac,
+                Q_scale=LQR_MANUAL_Q_SCALE,
+                R_scale=LQR_MANUAL_R_SCALE,
+            )
+
+        if controller_name == "Disturbance rejection":
+            return StateFeedbackControllerDisturbanceRejection.cost_matrices(
+                hvac,
+                Q_scale=LMI_MANUAL_Q_SCALE,
+                R_scale=LMI_MANUAL_R_SCALE,
+            )
+
+    if tuning_mode in ["bryson", "bryson_sweep"]:
+        return bryson_cost_matrices(
+            hvac,
+            x_max_dev=x_max,
+            xI_max=xI_max,
+            u_max=u_max,
+            Qx_factor=Qx_factor,
+            Qi_factor=Qi_factor,
+            R_factor=R_factor,
+        )
+
+    raise ValueError(f"Unknown tuning mode: {tuning_mode}")
+
+
+def tuning_label(
+    controller_name: str,
+    tuning_mode: str,
+    Qx_factor: float = 1.0,
+    Qi_factor: float = 1.0,
+    R_factor: float = 1.0,
+    score: float | None = None,
+):
+    if tuning_mode == "manual":
+        if controller_name == "LQR":
+            return f"LQR manual: Qscale={LQR_MANUAL_Q_SCALE:g}, Rscale={LQR_MANUAL_R_SCALE:g}"
+
+        if controller_name == "Disturbance rejection":
+            return f"LMI manual: Qscale={LMI_MANUAL_Q_SCALE:g}, Rscale={LMI_MANUAL_R_SCALE:g}"
+
+    if tuning_mode == "bryson":
+        return (
+            f"{controller_name} Bryson: "
+            f"air_max={air_temp_max_error:g}, "
+            f"water_max={water_temp_max_error:g}, "
+            f"xI_max={xI_max[0]:g}, "
+            f"u_max=[{u_max[0]:g}, {u_max[1]:g}], "
+            f"factors=[1, 1, 1]"
+        )
+
+    if tuning_mode == "bryson_sweep":
+        score_text = "" if score is None else f", score={score:.6g}"
+        return (
+            f"{controller_name} Bryson sweep: "
+            f"air_max={air_temp_max_error:g}, "
+            f"water_max={water_temp_max_error:g}, "
+            f"xI_max={xI_max[0]:g}, "
+            f"u_max=[{u_max[0]:g}, {u_max[1]:g}], "
+            f"best_factors=[{Qx_factor:g}, {Qi_factor:g}, {R_factor:g}]"
+            f"{score_text}"
+        )
+
+    raise ValueError(f"Unknown tuning mode: {tuning_mode}")
+
+
+def run_sweep_candidate(controller_name: str, candidate_idx: int, Qx_factor: float, Qi_factor: float, R_factor: float):
+    tuning_mode = "bryson_sweep"
+
+    Qx_weights, Qi_weights, R_weights = bryson_weight_values(
+        x_max_dev=x_max,
+        xI_max=xI_max,
+        u_max=u_max,
         Qx_factor=Qx_factor,
         Qi_factor=Qi_factor,
         R_factor=R_factor,
     )
 
     candidate_name = (
-        f"DR sweep {candidate_idx}: "
-        f"Qx={Qx_weight:.6g}, Qi={Qi_weight:.6g}, R={R_weight:.6g} "
-        f"(factors: {Qx_factor}, {Qi_factor}, {R_factor})"
+        f"{controller_name} sweep {candidate_idx}: "
+        f"factors: Qx={Qx_factor}, Qi={Qi_factor}, R={R_factor}"
     )
 
-    Q_sweep, R_sweep = structured_cost_matrices(
-        hvac,
-        x_max_dev=structured_x_max_dev,
-        xI_max=structured_xI_max,
-        u_dev_max=structured_u_dev_max,
+    Q_sweep, R_sweep = make_cost_matrices_for_controller(
+        controller_name,
+        tuning_mode,
         Qx_factor=Qx_factor,
         Qi_factor=Qi_factor,
         R_factor=R_factor,
     )
 
-    controller_sweep = StateFeedbackControllerDisturbanceRejection.find_controller_gains(
-        hvac, Q=Q_sweep, R=R_sweep
-    )
-
+    controller_sweep = build_controller(controller_name, Q_sweep, R_sweep)
     result_sweep = simulate_controller(controller_sweep, candidate_name)
     combined = combined_metrics(result_sweep)
 
     return dict(
+        controller_name=controller_name,
         candidate_idx=candidate_idx,
         Qx_factor=Qx_factor,
         Qi_factor=Qi_factor,
         R_factor=R_factor,
-        Qx_weight=Qx_weight,
-        Qi_weight=Qi_weight,
-        R_weight=R_weight,
+        Q=Q_sweep,
+        R=R_sweep,
+        Qx_air_weight=Qx_weights[0],
+        Qx_water_weight=Qx_weights[K],
+        Qi_weight=Qi_weights[0],
+        R_weight=R_weights[0],
         name=candidate_name,
         result=result_sweep,
         **combined,
     )
 
 
-sweep_records = []
-
-if use_QR_tuning:
-    Qx_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
-    Qi_factors = [0.25, 0.5, 1.0, 2.0, 4.0]
-    R_factors  = [0.25, 0.5, 1.0, 2.0, 4.0]
-
+def run_bryson_sweep(controller_name: str):
     candidates = []
     candidate_idx = 0
 
@@ -930,27 +895,38 @@ if use_QR_tuning:
         for Qi_factor in Qi_factors:
             for R_factor in R_factors:
                 candidate_idx += 1
-                candidates.append((candidate_idx, Qx_factor, Qi_factor, R_factor))
+                candidates.append((controller_name, candidate_idx, Qx_factor, Qi_factor, R_factor))
 
-    print("\n=== Starting normalized Q/R factor sweep for disturbance-rejection controller ===")
+    print(f"\n=== Starting Bryson-normalized factor sweep for {controller_name} ===")
     print(f"Number of candidates: {len(candidates)}")
     print(
-        f"Base normalization: "
-        f"x_max_dev={structured_x_max_dev:g}, "
-        f"xI_max={structured_xI_max:g}, "
-        f"u_dev_max={structured_u_dev_max:g}"
+        f"Base Bryson limits: "
+        f"air_max={air_temp_max_error:g}, "
+        f"water_max={water_temp_max_error:g}, "
+        f"xI_max={xI_max[0]:g}, "
+        f"u_max=[{u_max[0]:g}, {u_max[1]:g}]"
     )
+
+    base_Qx_weights, base_Qi_weights, base_R_weights = bryson_weight_values(
+        x_max_dev=x_max,
+        xI_max=xI_max,
+        u_max=u_max,
+    )
+
     print(
         f"Base weights: "
-        f"Qx={structured_Qx_weight:.6g}, "
-        f"Qi={structured_Qi_weight:.6g}, "
-        f"R={structured_R_weight:.6g}"
+        f"Q_air={base_Qx_weights[0]:.6g}, "
+        f"Q_water={base_Qx_weights[K]:.6g}, "
+        f"Qi={base_Qi_weights[0]:.6g}, "
+        f"R={base_R_weights[0]:.6g}"
     )
 
-    if use_parallel_QR_tuning:
-        print(f"Running sweep in parallel with max_workers={max_parallel_workers}")
+    sweep_records = []
 
-        with ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
+    if USE_PARALLEL_SWEEP:
+        print(f"Running sweep in parallel with max_workers={MAX_PARALLEL_WORKERS}")
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_WORKERS) as executor:
             future_to_candidate = {
                 executor.submit(run_sweep_candidate, *candidate): candidate
                 for candidate in candidates
@@ -958,28 +934,28 @@ if use_QR_tuning:
 
             for future in as_completed(future_to_candidate):
                 candidate = future_to_candidate[future]
-                idx, Qx_factor, Qi_factor, R_factor = candidate
+                _, idx, Qx_factor, Qi_factor, R_factor = candidate
 
                 try:
                     record = future.result()
                     sweep_records.append(record)
                     print(
-                        f"Finished candidate {idx}: "
+                        f"Finished {controller_name} candidate {idx}: "
                         f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}, "
                         f"score={record['score']:.6g}"
                     )
                 except Exception as exc:
                     print(
-                        f"Candidate failed: idx={idx}, "
+                        f"{controller_name} candidate failed: idx={idx}, "
                         f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
                     )
                     print(f"Reason: {exc}")
 
     else:
         for candidate in candidates:
-            idx, Qx_factor, Qi_factor, R_factor = candidate
+            _, idx, Qx_factor, Qi_factor, R_factor = candidate
             print(
-                f"Synthesizing and simulating candidate {idx}: "
+                f"Synthesizing and simulating {controller_name} candidate {idx}: "
                 f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
             )
 
@@ -988,191 +964,155 @@ if use_QR_tuning:
                 sweep_records.append(record)
             except Exception as exc:
                 print(
-                    f"Candidate failed: idx={idx}, "
+                    f"{controller_name} candidate failed: idx={idx}, "
                     f"Qx_fac={Qx_factor}, Qi_fac={Qi_factor}, R_fac={R_factor}"
                 )
                 print(f"Reason: {exc}")
 
-    if len(sweep_records) > 0:
-        sweep_records_sorted = sorted(sweep_records, key=lambda item: item["score"])
+    if len(sweep_records) == 0:
+        raise RuntimeError(f"No sweep candidates were successfully simulated for {controller_name}.")
 
-        print("\n=== Best normalized Q/R factor sweep candidates by score ===")
-        for item in sweep_records_sorted[:10]:
-            print(
-                f"idx={item['candidate_idx']:>3}, "
-                f"Qx={item['Qx_weight']:>10.6g}, "
-                f"Qi={item['Qi_weight']:>10.6g}, "
-                f"R={item['R_weight']:>10.6g}, "
-                f"fac=[{item['Qx_factor']:g}, {item['Qi_factor']:g}, {item['R_factor']:g}], "
-                f"score={item['score']:.6g}, "
-                f"deadband_rms={item['deadband_rms']:.6g}, "
-                f"frac_out={item['fraction_outside']:.6g}, "
-                f"sat={item['saturation_fraction']:.6g}, "
-                f"TV={item['total_variation']:.6g}, "
-                f"rms_du_dt={item['rms_du_dt']:.6g}"
-            )
+    sweep_records_sorted = sorted(sweep_records, key=lambda item: item["score"])
+    best_sweep = sweep_records_sorted[0]
 
-        sweep_records_plot = sorted(sweep_records, key=lambda item: item["candidate_idx"])
-        x_sweep = np.array([item["candidate_idx"] for item in sweep_records_plot])
-
-        deadband_rms_vals = np.array([item["deadband_rms"] for item in sweep_records_plot])
-        fraction_outside_vals = np.array([item["fraction_outside"] for item in sweep_records_plot])
-        saturation_vals = np.array([item["saturation_fraction"] for item in sweep_records_plot])
-        total_variation_vals = np.array([item["total_variation"] for item in sweep_records_plot])
-        rms_du_dt_vals = np.array([item["rms_du_dt"] for item in sweep_records_plot])
-        score_vals = np.array([item["score"] for item in sweep_records_plot])
-
-        best_idx = sweep_records_sorted[0]["candidate_idx"]
-
-        fig_sweep, ax_sweep = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
-
-        ax_sweep[0].plot(x_sweep, deadband_rms_vals, marker="o", linewidth=1.5)
-        ax_sweep[0].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[0].set_ylabel("Deadband RMS [°C]")
-        ax_sweep[0].grid(True, alpha=0.35)
-
-        ax_sweep[1].plot(x_sweep, fraction_outside_vals, marker="o", linewidth=1.5)
-        ax_sweep[1].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[1].set_ylabel("Fraction outside [-]")
-        ax_sweep[1].grid(True, alpha=0.35)
-
-        ax_sweep[2].plot(x_sweep, saturation_vals, marker="o", linewidth=1.5)
-        ax_sweep[2].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[2].set_ylabel("Saturation fraction [-]")
-        ax_sweep[2].grid(True, alpha=0.35)
-
-        ax_sweep[3].plot(x_sweep, total_variation_vals, marker="o", linewidth=1.5)
-        ax_sweep[3].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[3].set_ylabel("Total variation [-]")
-        ax_sweep[3].grid(True, alpha=0.35)
-
-        ax_sweep[4].plot(x_sweep, rms_du_dt_vals, marker="o", linewidth=1.5)
-        ax_sweep[4].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[4].set_ylabel("RMS du/dt [1/s]")
-        ax_sweep[4].grid(True, alpha=0.35)
-
-        ax_sweep[5].plot(x_sweep, score_vals, marker="o", linewidth=1.5)
-        ax_sweep[5].axvline(best_idx, color="black", linestyle="--", linewidth=1)
-        ax_sweep[5].set_ylabel("Score [-]")
-        ax_sweep[5].set_xlabel("Candidate index")
-        ax_sweep[5].grid(True, alpha=0.35)
-
-        fig_sweep.suptitle(
-            f"Normalized Q/R factor sweep — disturbance-rejection controller\n"
-            f"Deadband margin = ±{deadband_margin:.3f} °C. Dashed line marks lowest-score candidate.",
-            fontweight="bold"
+    print(f"\n=== Best {controller_name} Bryson-normalized sweep candidates by score ===")
+    for item in sweep_records_sorted[:10]:
+        print(
+            f"idx={item['candidate_idx']:>3}, "
+            f"fac=[{item['Qx_factor']:g}, {item['Qi_factor']:g}, {item['R_factor']:g}], "
+            f"Q_air={item['Qx_air_weight']:.6g}, "
+            f"Q_water={item['Qx_water_weight']:.6g}, "
+            f"Qi={item['Qi_weight']:.6g}, "
+            f"R={item['R_weight']:.6g}, "
+            f"score={item['score']:.6g}, "
+            f"deadband_rms={item['deadband_rms']:.6g}, "
+            f"frac_out={item['fraction_outside']:.6g}, "
+            f"sat={item['saturation_fraction']:.6g}, "
+            f"TV={item['total_variation']:.6g}, "
+            f"rms_du_dt={item['rms_du_dt']:.6g}"
         )
 
-        plt.tight_layout()
+    plot_sweep_summary(controller_name, sweep_records_sorted)
 
-        best_sweep = sweep_records_sorted[0]
+    return best_sweep, sweep_records_sorted
+
+
+def plot_sweep_summary(controller_name: str, sweep_records_sorted: list[dict]):
+    sweep_records_plot = sorted(sweep_records_sorted, key=lambda item: item["candidate_idx"])
+    x_sweep = np.array([item["candidate_idx"] for item in sweep_records_plot])
+
+    deadband_rms_vals = np.array([item["deadband_rms"] for item in sweep_records_plot])
+    fraction_outside_vals = np.array([item["fraction_outside"] for item in sweep_records_plot])
+    saturation_vals = np.array([item["saturation_fraction"] for item in sweep_records_plot])
+    total_variation_vals = np.array([item["total_variation"] for item in sweep_records_plot])
+    rms_du_dt_vals = np.array([item["rms_du_dt"] for item in sweep_records_plot])
+    score_vals = np.array([item["score"] for item in sweep_records_plot])
+
+    best_idx = sweep_records_sorted[0]["candidate_idx"]
+
+    fig_sweep, ax_sweep = plt.subplots(6, 1, figsize=(12, 14), sharex=True)
+
+    ax_sweep[0].plot(x_sweep, deadband_rms_vals, marker="o", linewidth=1.5)
+    ax_sweep[0].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[0].set_ylabel("Deadband RMS [°C]")
+    ax_sweep[0].grid(True, alpha=0.35)
+
+    ax_sweep[1].plot(x_sweep, fraction_outside_vals, marker="o", linewidth=1.5)
+    ax_sweep[1].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[1].set_ylabel("Fraction outside [-]")
+    ax_sweep[1].grid(True, alpha=0.35)
+
+    ax_sweep[2].plot(x_sweep, saturation_vals, marker="o", linewidth=1.5)
+    ax_sweep[2].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[2].set_ylabel("Saturation fraction [-]")
+    ax_sweep[2].grid(True, alpha=0.35)
+
+    ax_sweep[3].plot(x_sweep, total_variation_vals, marker="o", linewidth=1.5)
+    ax_sweep[3].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[3].set_ylabel("Total variation [-]")
+    ax_sweep[3].grid(True, alpha=0.35)
+
+    ax_sweep[4].plot(x_sweep, rms_du_dt_vals, marker="o", linewidth=1.5)
+    ax_sweep[4].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[4].set_ylabel("RMS du/dt [1/s]")
+    ax_sweep[4].grid(True, alpha=0.35)
+
+    ax_sweep[5].plot(x_sweep, score_vals, marker="o", linewidth=1.5)
+    ax_sweep[5].axvline(best_idx, color="black", linestyle="--", linewidth=1)
+    ax_sweep[5].set_ylabel("Score [-]")
+    ax_sweep[5].set_xlabel("Candidate index")
+    ax_sweep[5].grid(True, alpha=0.35)
+
+    fig_sweep.suptitle(
+        f"Bryson-normalized Q/R factor sweep — {controller_name}\n"
+        f"Deadband margin = ±{deadband_margin:.3f} °C. Dashed line marks lowest-score candidate.",
+        fontweight="bold"
+    )
+
+    plt.tight_layout()
+
+
+def build_and_simulate_controller(controller_name: str):
+    tuning_mode = controller_tuning_mode(controller_name)
+    validate_tuning_mode(tuning_mode)
+
+    if tuning_mode in ["manual", "bryson"]:
+        Q, R = make_cost_matrices_for_controller(controller_name, tuning_mode)
+        controller = build_controller(controller_name, Q, R)
+        label = tuning_label(controller_name, tuning_mode)
+        result = simulate_controller(controller, controller_name)
+
+        return result, label, None, Q, R
+
+    if tuning_mode == "bryson_sweep":
+        best_sweep, sweep_records_sorted = run_bryson_sweep(controller_name)
         best_result = best_sweep["result"]
 
-        fig_best, ax_best = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
-
-        ax_best[0].plot(
-            best_result["sol"].t,
-            best_result["T_inlet"],
-            linestyle=":",
-            linewidth=2,
-            color="black",
-            label="Inlet air disturbance"
+        label = tuning_label(
+            controller_name,
+            tuning_mode,
+            Qx_factor=best_sweep["Qx_factor"],
+            Qi_factor=best_sweep["Qi_factor"],
+            R_factor=best_sweep["R_factor"],
+            score=best_sweep["score"],
         )
 
-        ax_best[0].plot(
-            best_result["sol"].t,
-            best_result["T_air_cooler"].mean(axis=0),
-            linewidth=2,
-            label="Avg air — Cooler (best sweep)"
-        )
+        # Rename the result so later plots use the clean controller name.
+        best_result["name"] = controller_name
 
-        ax_best[0].plot(
-            best_result["sol"].t,
-            best_result["T_air_heater"].mean(axis=0),
-            linewidth=2,
-            label="Avg air — Heater (best sweep)"
-        )
+        return best_result, label, sweep_records_sorted, best_sweep["Q"], best_sweep["R"]
 
-        if "LQR" in results:
-            ax_best[0].plot(
-                results["LQR"]["sol"].t,
-                results["LQR"]["T_air_cooler"].mean(axis=0),
-                linewidth=1.5,
-                linestyle="--",
-                label="Avg air — Cooler (LQR)"
-            )
+    raise ValueError(f"Unknown tuning mode: {tuning_mode}")
 
-            ax_best[0].plot(
-                results["LQR"]["sol"].t,
-                results["LQR"]["T_air_heater"].mean(axis=0),
-                linewidth=1.5,
-                linestyle="--",
-                label="Avg air — Heater (LQR)"
-            )
 
-        cooler_ref_C = T1_ref - 273.15
-        heater_ref_C = T2_ref - 273.15
+# ── Build and simulate selected controller(s) ─────────────────────────────────
+controllers = {}
+results = {}
+controller_qr_labels = {}
+sweep_records_by_controller = {}
+final_QR_matrices = {}
 
-        ax_best[0].axhline(cooler_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Cooler ({cooler_ref_C:.1f} °C)")
-        ax_best[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
-        ax_best[0].set_title(
-            f"Best Normalized Q/R Sweep Candidate\n"
-            f"Qx={best_sweep['Qx_weight']:.6g}, "
-            f"Qi={best_sweep['Qi_weight']:.6g}, "
-            f"R={best_sweep['R_weight']:.6g} "
-            f"(fac=[{best_sweep['Qx_factor']}, {best_sweep['Qi_factor']}, {best_sweep['R_factor']}])",
-            fontweight="bold"
-        )
-        ax_best[0].set_ylabel("Temperature [°C]", fontweight="bold")
-        ax_best[0].grid(True, alpha=0.35)
-        ax_best[0].legend(loc="best")
+for controller_name in selected_controller_names(RUN_MODE):
+    print(f"\n\n============================================================")
+    print(f"Preparing controller: {controller_name}")
+    print(f"Tuning mode: {controller_tuning_mode(controller_name)}")
+    print(f"============================================================")
 
-        ax_best[1].plot(
-            best_result["sol"].t,
-            best_result["u_hist"][0],
-            linewidth=2,
-            label="u_sat — Cooler (best sweep)"
-        )
+    result, label, sweep_records, Q_used, R_used = build_and_simulate_controller(controller_name)
 
-        ax_best[1].plot(
-            best_result["sol"].t,
-            best_result["u_hist"][1],
-            linewidth=2,
-            label="u_sat — Heater (best sweep)"
-        )
+    controllers[controller_name] = result["controller"]
+    results[controller_name] = result
+    controller_qr_labels[controller_name] = label
+    final_QR_matrices[controller_name] = dict(Q=Q_used, R=R_used)
 
-        if "LQR" in results:
-            ax_best[1].plot(
-                results["LQR"]["sol"].t,
-                results["LQR"]["u_hist"][0],
-                linewidth=1.5,
-                linestyle="--",
-                label="u_sat — Cooler (LQR)"
-            )
+    if sweep_records is not None:
+        sweep_records_by_controller[controller_name] = sweep_records
 
-            ax_best[1].plot(
-                results["LQR"]["sol"].t,
-                results["LQR"]["u_hist"][1],
-                linewidth=1.5,
-                linestyle="--",
-                label="u_sat — Heater (LQR)"
-            )
-
-        ax_best[1].set_title("Valve Inputs", fontweight="bold")
-        ax_best[1].set_xlabel("Time [s]", fontweight="bold")
-        ax_best[1].set_ylabel("Valve units [-]", fontweight="bold")
-        ax_best[1].set_ylim(-0.05, 1.05)
-        ax_best[1].grid(True, alpha=0.35)
-        ax_best[1].legend(loc="best")
-
-        plt.tight_layout()
-
-    else:
-        print("\nNo Q/R sweep candidates were successfully simulated.")
+qr_info_text = " | ".join(controller_qr_labels.values())
 
 
 # This is the result used for the original detailed diagnostic plot.
-if compare_controllers:
+if RUN_MODE == "compare" and "Disturbance rejection" in results:
     active_name = "Disturbance rejection"
 else:
     active_name = next(iter(results.keys()))
@@ -1207,25 +1147,70 @@ heater_ref_C = T2_ref - 273.15
 
 
 # ── Terminal summary ──────────────────────────────────────────────────────────
+np.set_printoptions(precision=8, suppress=False, linewidth=200)
+
 print(f"\n=== Test case ===")
 print(f"  {TEST_CASE}")
 print(f"  {disturbance_label}")
+
+print(f"\n=== Run configuration ===")
+print(f"  RUN_MODE: {RUN_MODE}")
+print(f"  LQR_TUNING_MODE: {LQR_TUNING_MODE}")
+print(f"  LMI_TUNING_MODE: {LMI_TUNING_MODE}")
+print(f"  USE_PARALLEL_SWEEP: {USE_PARALLEL_SWEEP}")
+print(f"  MAX_PARALLEL_WORKERS: {MAX_PARALLEL_WORKERS}")
 
 print(f"\n=== Controller Q/R settings ===")
 for name, label in controller_qr_labels.items():
     print(f"  {name}: {label}")
 
-print(f"\n=== Actual Q/R weight values ===")
-if "Disturbance rejection" in controllers:
-    print("  Disturbance rejection structured weights:")
-    print(f"    Qx weight: {structured_Qx_weight:.8g}")
-    print(f"    Qi weight: {structured_Qi_weight:.8g}")
-    print(f"    R weight:  {structured_R_weight:.8g}")
-if "LQR" in controllers and use_bryson_for_lqr:
-    print("  LQR Bryson weights:")
-    print(f"    Qx weight: {lqr_Qx_weight:.8g}")
-    print(f"    Qi weights: {lqr_Qi_weights}")
-    print(f"    R weights:  {lqr_R_weights}")
+print(f"\n=== Bryson limits ===")
+print(f"  Air temperature max error:   {air_temp_max_error:g} K")
+print(f"  Water temperature max error: {water_temp_max_error:g} K")
+print(f"  Wanted settling time:        {wanted_settling_time:g} s")
+print(f"  Integrator max:              {xI_max[0]:g} K·s")
+print(f"  Input max:                   [{u_max[0]:g}, {u_max[1]:g}]")
+
+base_Qx_weights, base_Qi_weights, base_R_weights = bryson_weight_values(
+    x_max_dev=x_max,
+    xI_max=xI_max,
+    u_max=u_max,
+)
+
+print(f"\n=== Base Bryson weight values ===")
+print(f"  Q air weight:   {base_Qx_weights[0]:.8g}")
+print(f"  Q water weight: {base_Qx_weights[K]:.8g}")
+print(f"  Qi weights:     {base_Qi_weights}")
+print(f"  R weights:      {base_R_weights}")
+
+print(f"\n=== Final Q/R matrices actually used ===")
+for name, qr in final_QR_matrices.items():
+    Q_used = qr["Q"]
+    R_used = qr["R"]
+
+    print(f"\n--- {name} ---")
+    print(f"Q shape: {Q_used.shape}")
+    print(f"R shape: {R_used.shape}")
+
+    print("Q diagonal:")
+    print(np.diag(Q_used))
+
+    print("R matrix:")
+    print(R_used)
+
+if "Disturbance rejection" in final_QR_matrices and "LQR" in final_QR_matrices:
+    Q_lmi = final_QR_matrices["Disturbance rejection"]["Q"]
+    R_lmi = final_QR_matrices["Disturbance rejection"]["R"]
+    Q_lqr = final_QR_matrices["LQR"]["Q"]
+    R_lqr = final_QR_matrices["LQR"]["R"]
+
+    print(f"\n=== Q/R equality check: LMI vs LQR ===")
+    print(f"  Q same shape: {Q_lmi.shape == Q_lqr.shape}")
+    print(f"  R same shape: {R_lmi.shape == R_lqr.shape}")
+    print(f"  max |Q_LMI - Q_LQR|: {np.max(np.abs(Q_lmi - Q_lqr)):.12g}")
+    print(f"  max |R_LMI - R_LQR|: {np.max(np.abs(R_lmi - R_lqr)):.12g}")
+    print(f"  np.allclose(Q_LMI, Q_LQR): {np.allclose(Q_lmi, Q_lqr)}")
+    print(f"  np.allclose(R_LMI, R_LQR): {np.allclose(R_lmi, R_lqr)}")
 
 for name, result in results.items():
     print(f"\n\n============================================================")
@@ -1279,7 +1264,7 @@ for name, result in results.items():
 
 
 # ── Compact controller comparison table ───────────────────────────────────────
-if compare_controllers and "Disturbance rejection" in results and "LQR" in results:
+if RUN_MODE == "compare" and "Disturbance rejection" in results and "LQR" in results:
     print("\n\n============================================================")
     print("Compact controller comparison")
     print("============================================================")
@@ -1300,8 +1285,6 @@ if compare_controllers and "Disturbance rejection" in results and "LQR" in resul
         "peak_output_deviation",
         "attenuation_db",
     ]
-
-    controller_names = ["Disturbance rejection", "LQR"]
 
     for output_name, metric_name in [
         ("Cooler output", "metrics_cooler"),
@@ -1336,63 +1319,64 @@ if compare_controllers and "Disturbance rejection" in results and "LQR" in resul
 
 
 # ── Comparison report plot: temperatures and valve inputs ─────────────────────
-fig_compare, ax_compare = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+if len(results) > 1:
+    fig_compare, ax_compare = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
 
-ax_compare[0].plot(sol.t, T_inlet, linestyle=":", linewidth=2, color="black", label="Inlet air disturbance")
+    ax_compare[0].plot(sol.t, T_inlet, linestyle=":", linewidth=2, color="black", label="Inlet air disturbance")
 
-for name, result in results.items():
-    ax_compare[0].plot(
-        result["sol"].t,
-        result["T_air_cooler"].mean(axis=0),
-        linewidth=2,
-        label=f"Avg air — Cooler ({name})"
+    for name, result in results.items():
+        ax_compare[0].plot(
+            result["sol"].t,
+            result["T_air_cooler"].mean(axis=0),
+            linewidth=2,
+            label=f"Avg air — Cooler ({name})"
+        )
+
+        ax_compare[0].plot(
+            result["sol"].t,
+            result["T_air_heater"].mean(axis=0),
+            linewidth=2,
+            label=f"Avg air — Heater ({name})"
+        )
+
+    ax_compare[0].axhline(cooler_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Cooler ({cooler_ref_C:.1f} °C)")
+    ax_compare[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
+    ax_compare[0].set_title(f"Air Temperature — Controller Comparison\n{disturbance_label}", fontweight="bold")
+    ax_compare[0].set_ylabel("Temperature [°C]", fontweight="bold")
+    ax_compare[0].grid(True, alpha=0.35)
+    ax_compare[0].legend(loc="best")
+
+    for name, result in results.items():
+        ax_compare[1].plot(
+            result["sol"].t,
+            result["u_hist"][0],
+            linewidth=2,
+            label=f"u_sat — Cooler ({name})"
+        )
+
+        ax_compare[1].plot(
+            result["sol"].t,
+            result["u_hist"][1],
+            linewidth=2,
+            label=f"u_sat — Heater ({name})"
+        )
+
+    ax_compare[1].set_title("Valve Inputs — Controller Comparison", fontweight="bold")
+    ax_compare[1].set_xlabel("Time [s]", fontweight="bold")
+    ax_compare[1].set_ylabel("Valve units [-]", fontweight="bold")
+    ax_compare[1].set_ylim(-0.05, 1.05)
+    ax_compare[1].grid(True, alpha=0.35)
+    ax_compare[1].legend(loc="best")
+
+    fig_compare.text(
+        0.5,
+        0.01,
+        qr_info_text,
+        ha="center",
+        fontsize=9
     )
 
-    ax_compare[0].plot(
-        result["sol"].t,
-        result["T_air_heater"].mean(axis=0),
-        linewidth=2,
-        label=f"Avg air — Heater ({name})"
-    )
-
-ax_compare[0].axhline(cooler_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Cooler ({cooler_ref_C:.1f} °C)")
-ax_compare[0].axhline(heater_ref_C, linestyle="--", linewidth=1.5, label=f"Ref Heater ({heater_ref_C:.1f} °C)")
-ax_compare[0].set_title(f"Air Temperature — Controller Comparison\n{disturbance_label}", fontweight="bold")
-ax_compare[0].set_ylabel("Temperature [°C]", fontweight="bold")
-ax_compare[0].grid(True, alpha=0.35)
-ax_compare[0].legend(loc="best")
-
-for name, result in results.items():
-    ax_compare[1].plot(
-        result["sol"].t,
-        result["u_hist"][0],
-        linewidth=2,
-        label=f"u_sat — Cooler ({name})"
-    )
-
-    ax_compare[1].plot(
-        result["sol"].t,
-        result["u_hist"][1],
-        linewidth=2,
-        label=f"u_sat — Heater ({name})"
-    )
-
-ax_compare[1].set_title("Valve Inputs — Controller Comparison", fontweight="bold")
-ax_compare[1].set_xlabel("Time [s]", fontweight="bold")
-ax_compare[1].set_ylabel("Valve units [-]", fontweight="bold")
-ax_compare[1].set_ylim(-0.05, 1.05)
-ax_compare[1].grid(True, alpha=0.35)
-ax_compare[1].legend(loc="best")
-
-fig_compare.text(
-    0.5,
-    0.01,
-    qr_info_text,
-    ha="center",
-    fontsize=9
-)
-
-plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
 
 
 # ── Report plot: active controller only ────────────────────────────────────────
@@ -1428,7 +1412,7 @@ fig_report.text(
 plt.tight_layout(rect=[0, 0.04, 1, 1])
 
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
+# ── Diagnostic plot ───────────────────────────────────────────────────────────
 fig, axes = plt.subplots(6, 2, figsize=(14, 24), sharex=True)
 
 axes[0, 0].plot(sol.t, T_air_cooler.mean(axis=0), color="tomato", linewidth=2, label="Avg air")
