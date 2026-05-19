@@ -52,37 +52,62 @@ hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Toggles ───────────────────────────────────────────────────────────────────
 COMPARE_CONTROLLERS       = True   # True: overlay both in one 2×1 layout
-USE_DISTURBANCE_REJECTION = True   # Used when COMPARE_CONTROLLERS = False
-USE_BRYSON                = False  # Only used for LQR (not compatible with LMI design)
-CASE_DISTURBANCE          = 0      # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined
-
-# ── Bryson bounds ─────────────────────────────────────────────────────────────
-x_max  = np.full(20, 20 + 273.15)
-u_max  = np.array([0.5, 0.5])
-xI_max = np.array([10.0, 10.0])
+USE_DISTURBANCE_REJECTION = False   # Used when COMPARE_CONTROLLERS = False
+USE_BRYSON                = True    # Only used for LQR (not compatible with LMI design)
+CASE_DISTURBANCE          = 5       # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined, 5: Step change in T_in
+PLOT_OMEGA                = True   # True: add a third subplot with mean omega per controller
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
 N = hvac.total_states
 
+# ── Bryson bounds ─────────────────────────────────────────────────────────────
+air_temp_max_error = 1.0    # [K]
+water_temp_max_error = 50.0 # [K]
+wanted_settling_time = 2.0 # [s]
+
+# Air states (first K and K+1:2K): air_temp_max_error
+# Water states (2K:3K and 3K:4K): water_temp_max_error
+x_max = np.concatenate([
+    np.full(K, air_temp_max_error),
+    np.full(K, water_temp_max_error),
+    np.full(K, air_temp_max_error),
+    np.full(K, water_temp_max_error),
+])
+
+# Integral states: air_temp_max_error * wanted_settling_time
+xI_max = np.full(2, air_temp_max_error * wanted_settling_time)
+
+u_max  = np.array([1.0, 1.0])
+
 # ── Time ──────────────────────────────────────────────────────────────────────
 t_day          = 24 * 3600
-points_per_day = 3000         #t_day * 3
-t_end          = 30               #t_day * 2
-t_eval         = np.linspace(0, t_end, points_per_day)
-
-# ── Initial conditions ────────────────────────────────────────────────────────
-x0 = np.concatenate([
-    np.full(K, 23 + 273.15),
-    np.full(K, 23 + 273.15),
-    np.full(K, 9.9 + 273.15),
-    np.full(K, 9.9 + 273.15),
-])
+points_per_day = 3000
+t_end          = 100
+t_start = 58 if CASE_DISTURBANCE == 5 else 0
+t_eval  = np.linspace(t_start, t_end, points_per_day)
 
 # ── References ────────────────────────────────────────────────────────────────
 T1_ref = 10.0 + 273.15
 T2_ref = 20.0 + 273.15
 r      = np.array([T1_ref, T2_ref])
+
+# ── Initial conditions ────────────────────────────────────────────────────────
+if CASE_DISTURBANCE == 5:
+    # Start at reference, then step T_in at t=60s
+    x0 = np.concatenate([
+        np.full(K, 15 + 273.15),
+        np.full(K, 15 + 273.15),
+        np.full(K, 9.9 + 273.15),
+        np.full(K, 9.9 + 273.15),
+    ])
+else:
+    x0 = np.concatenate([
+        np.full(K, 23 + 273.15),
+        np.full(K, 23 + 273.15),
+        np.full(K, 9.9 + 273.15),
+        np.full(K, 9.9 + 273.15),
+    ])
 
 # ── Disturbance function ──────────────────────────────────────────────────────
 def d(t):
@@ -91,7 +116,8 @@ def d(t):
         case 0:
             T_in  = 23 + 273.15
             rh_in = 0.832
-            volume_flow_wet_air = (params_cooler["volume_flow_wet_air"] / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
+            volume_flow_wet_air = (params_cooler["volume_flow_wet_air"]
+                                   / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 1:
             shift_t = t - 54000
             T_in = (23
@@ -105,7 +131,7 @@ def d(t):
                                    / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 2:
             T_in  = 23 + 273.15
-            rh_in = np.clip(0.75 + 0.25 * np.sin(2 * np.pi * t / T_day + np.pi / 3), 0.0, 1.0)
+            rh_in = np.clip(0.70 + 0.25 * np.sin(2 * np.pi * t / T_day + np.pi / 3), 0.0, 1.0)
             volume_flow_wet_air = (params_cooler["volume_flow_wet_air"]
                                    / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 3:
@@ -121,9 +147,17 @@ def d(t):
                     + 0.5 * np.cos(2 * np.pi * shift_t / 28800)
                     + 2   * np.sin(2 * np.pi * t / 259200)
                     + 273.15)
-            rh_in               = np.clip(0.75 + 0.25 * np.sin(2 * np.pi * t / T_day + 2 * np.pi / 3), 0.0, 1.0)
+            rh_in               = np.clip(0.70 + 0.25 * np.sin(2 * np.pi * t / T_day + 2 * np.pi / 3), 0.0, 1.0)
             flow_base           = hvac._lin_components[0].volume_flow_wet_air
             volume_flow_wet_air = flow_base + 0.5 * flow_base * np.cos(2 * np.pi * t / (t_day / 2))
+        case 5:
+            # All constant, but T_in steps to 23°C after 60 seconds
+            T_in = 15 + 273.15 if t < 60 else 23 + 273.15
+            rh_in = 0.832
+            volume_flow_wet_air = (
+                params_cooler["volume_flow_wet_air"]
+                / (params_cooler["num_segments"] * params_cooler["num_pipes"])
+            )
     return np.array([T_in, rh_in, volume_flow_wet_air])
 
 # ── Build controller and simulate ─────────────────────────────────────────────
@@ -135,7 +169,7 @@ def build_and_simulate(use_disturbance_rejection):
     if use_disturbance_rejection:
         Q, R = ControllerCls.cost_matrices(hvac, Q_scale=10.0, Qi_scale=5.0, R_scale=5.0, use_disturbance_rejection=True)
     else:
-        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max)
+        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max, shifted=False)
                 if USE_BRYSON else
                 ControllerCls.cost_matrices(hvac, Q_scale=10000.0, R_scale=8.0))
     ctrl = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
@@ -167,13 +201,14 @@ def unpack(sol, ctrl):
         ctrl.compute_input(sol.y[:N, i], sol.y[N:, i], r)[0]
         for i in range(sol.y.shape[1])
     ]).T
-
-    ode_with_omega = ctrl.controller_derivatives(r=r, d=d, return_omega=True)
-    omega_hist = np.array([
-        ode_with_omega(sol.t[i], sol.y[:, i])[1]
-        for i in range(sol.y.shape[1])
-    ])  # shape: (n_timesteps, n_omega)
-
+    if PLOT_OMEGA:
+        ode_with_omega = ctrl.controller_derivatives(r=r, d=d, return_omega=True)
+        omega_hist = np.array([
+            ode_with_omega(sol.t[i], sol.y[:, i])[1]
+            for i in range(sol.y.shape[1])
+        ])
+    else:
+        omega_hist = None
     return T_inlet, T_air_cooler, T_air_heater, u_hist, omega_hist
 
 # ── Disturbance signals ───────────────────────────────────────────────────────
@@ -189,16 +224,21 @@ ctrl_colors = {
 }
 
 case_titles = {
-    0: "All Disturbances Constant",
+    0: "Constant Disturbances",
     1: "Temperature Disturbance Only",
     2: "Relative Humidity Disturbance Only",
     3: "Volumetric Flow Disturbance Only",
     4: "All Disturbances Combined",
+    5: "Step Change in T_in at t=60s",
 }
 
-# ── Figure — always 3×1 ───────────────────────────────────────────────────────
-fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
-ax_temp, ax_valve, ax_omega = axes
+# ── Figure — 2×1 or 3×1 depending on PLOT_OMEGA ──────────────────────────────
+n_rows     = 3 if PLOT_OMEGA else 2
+fig_height = 12 if PLOT_OMEGA else 9
+fig, axes  = plt.subplots(n_rows, 1, figsize=(13, fig_height), sharex=True)
+ax_temp    = axes[0]
+ax_valve   = axes[1]
+ax_omega   = axes[2] if PLOT_OMEGA else None
 
 # ── Shared disturbance overlays (drawn once) ──────────────────────────────────
 lines_r, labels_r = [], []
@@ -208,7 +248,7 @@ if CASE_DISTURBANCE in (2, 4):
     ax_rh = ax_temp.twinx()
     ax_rh.plot(t_ref, RH_in, color="steelblue", linewidth=1.5,
                linestyle="-.", alpha=0.7, label="RH in")
-    ax_rh.set_ylabel("RH [-]", color="steelblue", fontweight="bold")
+    ax_rh.set_ylabel("RH [-]", color="steelblue")
     ax_rh.set_ylim(-0.05, 1.05)
     ax_rh.tick_params(axis="y", labelcolor="steelblue")
     lines_r, labels_r = ax_rh.get_legend_handles_labels()
@@ -244,10 +284,11 @@ for sol_i, ctrl_i, lbl in solutions:
     ax_valve.plot(sol_i.t, u_hist[1], color=c_heater, linewidth=2,
                   linestyle="--", label=f"Heater ({lbl})")
 
-    ax_omega.plot(sol_i.t, omega_hist[:, :K].mean(axis=1), color=c_cooler,
-                  linewidth=2, label=f"Cooler ω ({lbl})")
-    ax_omega.plot(sol_i.t, omega_hist[:, K:].mean(axis=1), color=c_heater,
-                  linewidth=2, linestyle="--", label=f"Heater ω ({lbl})")
+    if PLOT_OMEGA:
+        ax_omega.plot(sol_i.t, omega_hist[:, :K].mean(axis=1), color=c_cooler,
+                      linewidth=2, label=f"Cooler ω ({lbl})")
+        ax_omega.plot(sol_i.t, omega_hist[:, K:].mean(axis=1), color=c_heater,
+                      linewidth=2, linestyle="--", label=f"Heater ω ({lbl})")
 
 # ── Reference lines — black, drawn once on top ────────────────────────────────
 ax_temp.axhline(T1_ref - 273.15, color="black", linestyle="--",
@@ -256,7 +297,7 @@ ax_temp.axhline(T2_ref - 273.15, color="black", linestyle="-.",
                 linewidth=1.2, label=f"Heater ref ({T2_ref-273.15:.1f} °C)")
 
 # ── Inlet temp — plotted last so it appears below refs in legend ──────────────
-if CASE_DISTURBANCE in (1, 4):
+if CASE_DISTURBANCE in (1, 4, 5):
     ax_temp.plot(t_ref, np.array([d(t)[0] for t in t_ref]) - 273.15,
                  color="dimgray", linewidth=1.5, linestyle=":",
                  label="Inlet temp")
@@ -271,6 +312,8 @@ leg_temp = ax_temp.legend(lines_t + lines_r + lines_f,
                            fontsize=10, loc="upper right",
                            borderpad=1.2, labelspacing=0.6,
                            handlelength=2.5, handletextpad=0.8)
+ax_rh.set_ylabel("RH [-]", color="steelblue", fontweight="bold") if CASE_DISTURBANCE in (2, 4) else None
+ax_flow.set_ylabel("Air flow [m³/s]", color="mediumpurple", fontweight="bold") if CASE_DISTURBANCE in (3, 4) else None
 
 ax_valve.set_ylabel("Opening [-]", fontweight="bold")
 ax_valve.set_title("Valve Openings", fontweight="bold")
@@ -279,24 +322,30 @@ leg_valve = ax_valve.legend(fontsize=10, loc="upper right",
                              borderpad=1.2, labelspacing=0.6,
                              handlelength=2.5, handletextpad=0.8)
 
-ax_omega.set_ylabel("Mean ω [-]", fontweight="bold")
-ax_omega.set_xlabel("Time [s]", fontweight="bold")
-ax_omega.set_title("Mean Omega", fontweight="bold")
-ax_omega.grid(True, alpha=0.35)
-leg_omega = ax_omega.legend(fontsize=10, loc="upper right",
-                             borderpad=1.2, labelspacing=0.6,
-                             handlelength=2.5, handletextpad=0.8)
+if PLOT_OMEGA:
+    ax_omega.set_ylabel("ω [-]", fontweight="bold")
+    ax_omega.set_title("Omega", fontweight="bold")
+    ax_omega.grid(True, alpha=0.35)
+    ax_omega.legend(fontsize=10, loc="upper right",
+                    borderpad=1.2, labelspacing=0.6,
+                    handlelength=2.5, handletextpad=0.8)
+    ax_omega.set_xlabel("Time [s]", fontweight="bold")
+else:
+    ax_valve.set_xlabel("Time [s]", fontweight="bold")
+
+fig.subplots_adjust(right=0.86 if CASE_DISTURBANCE == 4 else 0.93)
+plt.tight_layout()
 
 case_filenames = {
-    0: "All_constant",
+    0: "Constant_disturbances",
     1: "T_in_disturbance",
     2: "RH_in_disturbance",
     3: "Air_flow_disturbance",
     4: "All_disturbances",
+    5: "Step_T_in",
 }
+
 ctrl_suffix = "normal_LMI_and_LQR" if COMPARE_CONTROLLERS else ("normal_LMI" if USE_DISTURBANCE_REJECTION else "normal_LQR")
 
-fig.subplots_adjust(right=0.86 if CASE_DISTURBANCE == 4 else 0.93)
-plt.tight_layout()
 plt.savefig(f"{case_filenames[CASE_DISTURBANCE]}_{ctrl_suffix}.png", dpi=300, bbox_inches="tight")
 plt.show()
