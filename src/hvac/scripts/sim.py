@@ -51,26 +51,26 @@ data_dir.mkdir(parents=True, exist_ok=True)
 hvac._export_state_space(data_dir / "HVAC_model.mat")
 
 # ── Toggles ───────────────────────────────────────────────────────────────────
-COMPARE_CONTROLLERS       = False   # True: overlay both in one 2×1 layout
+COMPARE_CONTROLLERS       = True    # True: overlay both in one 2×1 layout
 USE_DISTURBANCE_REJECTION = False   # Used when COMPARE_CONTROLLERS = False
-USE_BRYSON                = True   # Only used for LQR (not compatible with LMI design)
-CASE_DISTURBANCE          = 0      # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined
+USE_BRYSON                = True    # Only used for LQR (not compatible with LMI design)
+CASE_DISTURBANCE          = 5       # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined, 5: Step change in T_in
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
 N = hvac.total_states
 
 # ── Bryson bounds ─────────────────────────────────────────────────────────────
-air_temp_max_error = 2.0    # [K]
+air_temp_max_error = 1.0    # [K]
 water_temp_max_error = 50.0 # [K]
-wanted_settling_time = 5.0 # [s]
+wanted_settling_time = 2.0 # [s]
 
 # Air states (first K and K+1:2K): air_temp_max_error
 # Water states (2K:3K and 3K:4K): water_temp_max_error
 x_max = np.concatenate([
     np.full(K, air_temp_max_error),
-    np.full(K, air_temp_max_error),
     np.full(K, water_temp_max_error),
+    np.full(K, air_temp_max_error),
     np.full(K, water_temp_max_error),
 ])
 
@@ -82,13 +82,14 @@ u_max  = np.array([1.0, 1.0])
 # ── Time ──────────────────────────────────────────────────────────────────────
 t_day          = 24 * 3600
 points_per_day = 3000
-t_end          = 30
-t_eval         = np.linspace(0, t_end, points_per_day)
+t_end          = 100
+t_start = 58 if CASE_DISTURBANCE == 5 else 0
+t_eval  = np.linspace(t_start, t_end, points_per_day)
 
 # ── Initial conditions ────────────────────────────────────────────────────────
 x0 = np.concatenate([
-    np.full(K, 23 + 273.15),
-    np.full(K, 23 + 273.15),
+    np.full(K, 15 + 273.15),
+    np.full(K, 15 + 273.15),
     np.full(K, 9.9 + 273.15),
     np.full(K, 9.9 + 273.15),
 ])
@@ -120,7 +121,7 @@ def d(t):
                                    / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 2:
             T_in  = 23 + 273.15
-            rh_in = np.clip(0.75 + 0.25 * np.sin(2 * np.pi * t / T_day + np.pi / 3), 0.0, 1.0)
+            rh_in = np.clip(0.70 + 0.25 * np.sin(2 * np.pi * t / T_day + np.pi / 3), 0.0, 1.0)
             volume_flow_wet_air = (params_cooler["volume_flow_wet_air"]
                                    / (params_cooler["num_segments"] * params_cooler["num_pipes"]))
         case 3:
@@ -136,9 +137,17 @@ def d(t):
                     + 0.5 * np.cos(2 * np.pi * shift_t / 28800)
                     + 2   * np.sin(2 * np.pi * t / 259200)
                     + 273.15)
-            rh_in               = np.clip(0.75 + 0.25 * np.sin(2 * np.pi * t / T_day + 2 * np.pi / 3), 0.0, 1.0)
+            rh_in               = np.clip(0.70 + 0.25 * np.sin(2 * np.pi * t / T_day + 2 * np.pi / 3), 0.0, 1.0)
             flow_base           = hvac._lin_components[0].volume_flow_wet_air
             volume_flow_wet_air = flow_base + 0.5 * flow_base * np.cos(2 * np.pi * t / (t_day / 2))
+        case 5:
+            # All constant, but T_in steps to 28°C after 60 seconds
+            T_in = 15 + 273.15 if t < 60 else 23 + 273.15
+            rh_in = 0.832
+            volume_flow_wet_air = (
+                params_cooler["volume_flow_wet_air"]
+                / (params_cooler["num_segments"] * params_cooler["num_pipes"])
+            )
     return np.array([T_in, rh_in, volume_flow_wet_air])
 
 # ── Build controller and simulate ─────────────────────────────────────────────
@@ -150,7 +159,7 @@ def build_and_simulate(use_disturbance_rejection):
     if use_disturbance_rejection:
         Q, R = ControllerCls.cost_matrices(hvac, Q_scale=10.0, Qi_scale=5.0, R_scale=5.0, use_disturbance_rejection=True)
     else:
-        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max, shifted=False)
+        Q, R = (ControllerCls.cost_bryson(hvac, x_max=x_max, u_max=u_max, x_I_max=xI_max, shifted=True)
                 if USE_BRYSON else
                 ControllerCls.cost_matrices(hvac, Q_scale=10000.0, R_scale=8.0))
     ctrl = ControllerCls.find_controller_gains(hvac, Q=Q, R=R)
@@ -202,6 +211,7 @@ case_titles = {
     2: "Relative Humidity Disturbance Only",
     3: "Volumetric Flow Disturbance Only",
     4: "All Disturbances Combined",
+    5: "Step Change in T_in at t=60s",
 }
 
 # ── Figure — always 2×1 ───────────────────────────────────────────────────────
@@ -260,14 +270,14 @@ ax_temp.axhline(T2_ref - 273.15, color="black", linestyle="-.",
                 linewidth=1.2, label=f"Heater ref ({T2_ref-273.15:.1f} °C)")
 
 # ── Inlet temp — plotted last so it appears below refs in legend ──────────────
-if CASE_DISTURBANCE in (1, 4):
+if CASE_DISTURBANCE in (1, 4, 5):
     ax_temp.plot(t_ref, np.array([d(t)[0] for t in t_ref]) - 273.15,
                  color="dimgray", linewidth=1.5, linestyle=":",
                  label="Inlet temp")
     
 # ── Axes labels, limits, legends ─────────────────────────────────────────────
 ax_temp.set_ylabel("Temperature [°C]", fontweight="bold")
-ax_temp.set_title(f"Air Temperatures & Disturbances — LMI vs LQR", fontweight="bold")
+ax_temp.set_title(f"Air Temperatures & Disturbances — {case_titles[CASE_DISTURBANCE]}", fontweight="bold")
 ax_temp.grid(True, alpha=0.35)
 lines_t, labels_t = ax_temp.get_legend_handles_labels()
 leg_temp = ax_temp.legend(lines_t + lines_r + lines_f,
@@ -294,9 +304,10 @@ case_filenames = {
     2: "RH_in_disturbance",
     3: "Air_flow_disturbance",
     4: "All_disturbances",
+    5: "Step_T_in",
 }
 
 ctrl_suffix = "normal_LMI_and_LQR" if COMPARE_CONTROLLERS else ("normal_LMI" if USE_DISTURBANCE_REJECTION else "normal_LQR")
 
-# plt.savefig(f"{case_filenames[CASE_DISTURBANCE]}_{ctrl_suffix}.png", dpi=300, bbox_inches="tight")
+plt.savefig(f"{case_filenames[CASE_DISTURBANCE]}_{ctrl_suffix}.png", dpi=300, bbox_inches="tight")
 plt.show()
