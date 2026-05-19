@@ -55,7 +55,7 @@ COMPARE_CONTROLLERS       = True   # True: overlay both in one 2×1 layout
 USE_DISTURBANCE_REJECTION = False   # Used when COMPARE_CONTROLLERS = False
 USE_BRYSON                = True    # Only used for LQR (not compatible with LMI design)
 CASE_DISTURBANCE          = 5       # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined, 5: Step change in T_in
-PLOT_OMEGA                = True   # True: add a third subplot with mean omega per controller
+PLOT_OMEGA                = True   # True: add a third subplot with omega per controller
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
@@ -91,23 +91,6 @@ t_eval  = np.linspace(t_start, t_end, points_per_day)
 T1_ref = 10.0 + 273.15
 T2_ref = 20.0 + 273.15
 r      = np.array([T1_ref, T2_ref])
-
-# ── Initial conditions ────────────────────────────────────────────────────────
-if CASE_DISTURBANCE == 5:
-    # Start at reference, then step T_in at t=60s
-    x0 = np.concatenate([
-        np.full(K, 15 + 273.15),
-        np.full(K, 15 + 273.15),
-        np.full(K, 9.9 + 273.15),
-        np.full(K, 9.9 + 273.15),
-    ])
-else:
-    x0 = np.concatenate([
-        np.full(K, 23 + 273.15),
-        np.full(K, 23 + 273.15),
-        np.full(K, 9.9 + 273.15),
-        np.full(K, 9.9 + 273.15),
-    ])
 
 # ── Disturbance function ──────────────────────────────────────────────────────
 def d(t):
@@ -159,6 +142,15 @@ def d(t):
                 / (params_cooler["num_segments"] * params_cooler["num_pipes"])
             )
     return np.array([T_in, rh_in, volume_flow_wet_air])
+
+# ── Initial conditions ────────────────────────────────────────────────────────
+_T_in_0 = d(t_start)[0]
+x0 = np.concatenate([
+    np.full(K, _T_in_0),
+    np.full(K, _T_in_0),
+    np.full(K, 9.9 + 273.15),
+    np.full(K, 9.9 + 273.15),
+])
 
 # ── Build controller and simulate ─────────────────────────────────────────────
 def build_and_simulate(use_disturbance_rejection):
