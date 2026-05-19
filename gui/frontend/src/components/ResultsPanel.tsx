@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import Plot from 'react-plotly.js'
+import axios from 'axios'
 import type { SimResults, SimMetrics } from '../types'
 
 const DEFAULT_HEIGHT = 380
@@ -23,32 +24,112 @@ function downloadGains(metrics: SimMetrics, rowLabels: string[], colLabels: stri
   URL.revokeObjectURL(url)
 }
 
-const NODE_COLORS: Record<string, string> = {
-  cooler:   '#3b82f6',
-  heater:   '#ef4444',
-  airduct:  '#6b7280',
-  junction: '#8b5cf6',
+type ColorScheme = 'default' | 'viridis' | 'plasma' | 'coolwarm'
+
+// 11 anchor points (t = 0.0 … 1.0 in steps of 0.1) sampled directly from
+// matplotlib's colormap tables — keeps interpolation vivid and perceptually uniform.
+const COLORMAPS: Record<Exclude<ColorScheme, 'default'>, string[]> = {
+  viridis: [
+    '#440154', '#482475', '#414487', '#355f8d', '#2a788e',
+    '#21918c', '#22a884', '#44bf70', '#7ad151', '#bddf26', '#fde725',
+  ],
+  plasma: [
+    '#0d0887', '#41049d', '#6a00a8', '#8f0da4', '#b12a90',
+    '#cc4778', '#e16462', '#f2844b', '#fca636', '#fcce25', '#f0f921',
+  ],
+  coolwarm: [
+    '#3b4cc0', '#5d7ce6', '#88a7f5', '#b9caf5', '#dddddd',
+    '#f5c4b0', '#f5a27a', '#e8765c', '#cf4446', '#b40426', '#7f0000',
+  ],
 }
 
-function pickColor(label: string, idx: number): string {
-  const palette = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899']
-  const lower = label.toLowerCase()
-  if (lower.includes('cool')) return NODE_COLORS.cooler
-  if (lower.includes('heat')) return NODE_COLORS.heater
-  return palette[idx % palette.length]
+function hexToRgb(hex: string): [number, number, number] {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)]
+}
+function rgbToHex(r: number, g: number, b: number): string {
+  return '#' + [r,g,b].map(v => Math.round(v).toString(16).padStart(2,'0')).join('')
+}
+function sampleColormap(anchors: string[], t: number): string {
+  const n = anchors.length - 1
+  const i = Math.min(Math.floor(t * n), n - 1)
+  const f = t * n - i
+  const [r1,g1,b1] = hexToRgb(anchors[i])
+  const [r2,g2,b2] = hexToRgb(anchors[i+1])
+  return rgbToHex(r1+(r2-r1)*f, g1+(g2-g1)*f, b1+(b2-b1)*f)
+}
+
+type NodeType = 'cooler' | 'heater' | 'other'
+
+const TYPE_RANGES: Record<Exclude<ColorScheme, 'default'>, Record<NodeType, [number, number]>> = {
+  viridis:  { cooler: [0.05, 0.18], heater: [0.80, 0.95], other: [0.42, 0.58] },
+  plasma:   { cooler: [0.05, 0.18], heater: [0.80, 0.95], other: [0.42, 0.58] },
+  coolwarm: { cooler: [0.05, 0.20], heater: [0.80, 0.95], other: [0.45, 0.55] },
+}
+
+function assignColors(labels: string[], scheme: ColorScheme): string[] {
+  if (scheme === 'default') {
+    const fallback = ['#10b981', '#f59e0b', '#8b5cf6', '#ec4899']
+    let otherIdx = 0
+    return labels.map(label => {
+      const l = label.toLowerCase()
+      if (l.includes('cool')) return '#3b82f6'
+      if (l.includes('heat')) return '#ef4444'
+      return fallback[(otherIdx++) % fallback.length]
+    })
+  }
+  const groups: Record<NodeType, number[]> = { cooler: [], heater: [], other: [] }
+  labels.forEach((label, i) => {
+    const l = label.toLowerCase()
+    if (l.includes('cool'))      groups.cooler.push(i)
+    else if (l.includes('heat')) groups.heater.push(i)
+    else                         groups.other.push(i)
+  })
+  const colors = new Array<string>(labels.length)
+  const ranges = TYPE_RANGES[scheme]
+  for (const type of ['cooler', 'heater', 'other'] as NodeType[]) {
+    const indices = groups[type]
+    const [lo, hi] = ranges[type]
+    indices.forEach((globalIdx, rank) => {
+      const t = indices.length === 1 ? (lo + hi) / 2 : lo + (hi - lo) * rank / (indices.length - 1)
+      colors[globalIdx] = sampleColormap(COLORMAPS[scheme], t)
+    })
+  }
+  return colors
 }
 
 interface Props {
   results: SimResults
   onClose: () => void
+  theme?: 'dark' | 'light'
 }
 
 type Tab = 'temperatures' | 'valves' | 'humidity' | 'junctions' | 'metrics'
 
-export default function ResultsPanel({ results, onClose }: Props) {
-  const [tab,       setTab]       = useState<Tab>('temperatures')
-  const [collapsed, setCollapsed] = useState(false)
-  const [height,    setHeight]    = useState(DEFAULT_HEIGHT)
+export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props) {
+  const [tab,           setTab]           = useState<Tab>('temperatures')
+  const [collapsed,     setCollapsed]     = useState(false)
+  const [height,        setHeight]        = useState(DEFAULT_HEIGHT)
+  const [colorScheme,   setColorScheme]   = useState<ColorScheme>('default')
+  const [exporting,     setExporting]     = useState(false)
+
+  const handleMatplotlibExport = async () => {
+    if (tab === 'metrics') return
+    setExporting(true)
+    try {
+      const resp = await axios.post('http://localhost:8000/export_plot',
+        { tab, data: results, scheme: colorScheme },
+        { responseType: 'blob' }
+      )
+      const url = URL.createObjectURL(resp.data)
+      const a   = document.createElement('a')
+      a.href     = url
+      a.download = `hvac_${tab}.png`
+      a.click()
+      URL.revokeObjectURL(url)
+    } finally {
+      setExporting(false)
+    }
+  }
 
   const { t, outputs, valves, humidity, junctions, metrics, d_signal } = results
 
@@ -85,42 +166,35 @@ export default function ResultsPanel({ results, onClose }: Props) {
     line: { color: '#94a3b8', width: 1.5, dash: 'dot' as const },
   }
 
-  const tempTraces = Object.entries(outputs).flatMap(([, series], i) => {
-    const color = pickColor(series.label, i)
+  const outputEntries   = Object.entries(outputs)
+  const valveEntries    = Object.entries(valves)
+  const humidityEntries = Object.entries(humidity ?? {})
+
+  const tempColors     = assignColors(outputEntries.map(([, s]) => s.label), colorScheme)
+  const valveColors    = assignColors(valveEntries.map(([, s]) => s.label), colorScheme)
+  const humidityColors = assignColors(humidityEntries.map(([, s]) => s.label), colorScheme)
+
+  const tempTraces = outputEntries.flatMap(([, series], i) => {
+    const color = tempColors[i]
     return [
       { x: t, y: series.y, type: 'scatter' as const, mode: 'lines' as const,
-        name: series.label, legendgroup: series.label, line: { color, width: 2 } },
+        name: series.label, legendgroup: series.label, line: { color, width: 2.5 } },
       { x: [t[0], t[t.length - 1]], y: [series.ref, series.ref],
         type: 'scatter' as const, mode: 'lines' as const,
-        name: `${series.label} ref`, legendgroup: series.label,
-        line: { color, width: 1, dash: 'dash' as const }, showlegend: false },
+        name: `${series.label} ref (${series.ref.toFixed(1)} °C)`, legendgroup: series.label,
+        line: { color, width: 1.5, dash: 'dash' as const }, showlegend: true },
     ]
   })
 
-  const valveTraces = Object.entries(valves).map(([, series], i) => ({
+  const valveTraces = valveEntries.map(([, series], i) => ({
     x: t, y: series.y, type: 'scatter' as const, mode: 'lines' as const,
-    name: series.label, line: { color: pickColor(series.label, i), width: 2 },
+    name: series.label, line: { color: valveColors[i], width: 2 },
   }))
 
-  const junctionTempTraces = Object.entries(junctions ?? {}).map(([, jd]) => ({
-    x: t, y: jd.outlet_temperatures,
-    type: 'scatter' as const, mode: 'lines' as const,
-    name: `${jd.label} (mixed)`,
-    line: { color: '#f59e0b', width: 1.5, dash: 'dot' as const },
-  }))
-
-  const junctionHumidityTraces = Object.entries(junctions ?? {}).map(([, jd]) => ({
-    x: t, y: jd.outlet_specific_humidities,
-    type: 'scatter' as const, mode: 'lines' as const,
-    name: `${jd.label} (mixed)`,
-    line: { color: '#f59e0b', width: 1.5, dash: 'dot' as const },
-  }))
-
-  const humidityTraces = Object.entries(humidity ?? {}).map(([, series], i) => ({
-    x: t, y: series.y,
-    type: 'scatter' as const, mode: 'lines' as const,
+  const humidityTraces = humidityEntries.map(([, series], i) => ({
+    x: t, y: series.y, type: 'scatter' as const, mode: 'lines' as const,
     name: `${series.label} inlet`,
-    line: { color: pickColor(series.label, i), width: 2 },
+    line: { color: humidityColors[i], width: 2 },
   }))
 
   // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -137,12 +211,33 @@ export default function ResultsPanel({ results, onClose }: Props) {
     name: 'CL poles', marker: { color: '#6366f1', size: 8, symbol: 'x' as const },
   }
 
+  const isLight = theme === 'light'
+  const gridColor  = isLight ? '#dddddd' : '#334155'
+  const lineColor  = isLight ? '#333333' : '#94a3b8'
+  const axisStyle  = {
+    gridcolor:     gridColor,
+    gridwidth:     1,
+    showgrid:      true,
+    showline:      true,
+    linecolor:     lineColor,
+    linewidth:     1,
+    mirror:        true,     // draws the box (all 4 spines)
+    tickcolor:     lineColor,
+    tickfont:      { size: 11 },
+    zerolinecolor: gridColor,
+    zerolinewidth: 1,
+  }
   const commonLayout = {
-    paper_bgcolor: '#1e293b',
-    plot_bgcolor:  '#0f172a',
-    font:          { color: '#e2e8f0', size: 12 },
-    margin:        { t: 30, r: 20, b: 50, l: 60 },
-    legend:        { bgcolor: '#1e293b', bordercolor: '#334155', borderwidth: 1 },
+    paper_bgcolor: isLight ? '#ffffff' : '#1e293b',
+    plot_bgcolor:  isLight ? '#ffffff' : '#0f172a',
+    font:    { family: 'Arial, sans-serif', color: isLight ? '#333333' : '#e2e8f0', size: 12 },
+    margin:  { t: 40, r: 20, b: 55, l: 65 },
+    legend:  {
+      bgcolor:      isLight ? 'rgba(255,255,255,0.9)' : 'rgba(30,41,59,0.9)',
+      bordercolor:  isLight ? '#cccccc' : '#475569',
+      borderwidth:  1,
+      font:         { size: 11 },
+    },
   }
 
   return (
@@ -167,7 +262,35 @@ export default function ResultsPanel({ results, onClose }: Props) {
             </button>
           ))}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <select
+            value={colorScheme}
+            onChange={e => setColorScheme(e.target.value as ColorScheme)}
+            title="Plot color scheme"
+            style={{
+              background: 'var(--bg-deepest)', border: '1px solid var(--bg-mid)',
+              color: 'var(--text-sec)', borderRadius: 4, fontSize: 11, padding: '2px 6px', cursor: 'pointer',
+            }}
+          >
+            <option value="default">Default</option>
+            <option value="viridis">Viridis</option>
+            <option value="plasma">Plasma</option>
+            <option value="coolwarm">Coolwarm</option>
+          </select>
+          {tab !== 'metrics' && (
+            <button
+              onClick={handleMatplotlibExport}
+              disabled={exporting}
+              title={`Export ${tab} as matplotlib PNG`}
+              style={{
+                background: 'var(--bg-deepest)', border: '1px solid var(--bg-mid)',
+                color: exporting ? 'var(--text-muted)' : 'var(--text-sec)',
+                borderRadius: 4, fontSize: 11, padding: '2px 8px', cursor: exporting ? 'not-allowed' : 'pointer',
+              }}
+            >
+              {exporting ? 'Exporting…' : 'Save figure'}
+            </button>
+          )}
           <button
             className="close-btn"
             onClick={() => setCollapsed(c => !c)}
@@ -186,8 +309,8 @@ export default function ResultsPanel({ results, onClose }: Props) {
               data={[disturbanceTrace, ...tempTraces]}
               layout={{
                 ...commonLayout,
-                xaxis: { title: { text: 'Time (s)' },        gridcolor: '#334155', zerolinecolor: '#475569' },
-                yaxis: { title: { text: 'Temperature (°C)' }, gridcolor: '#334155', zerolinecolor: '#475569' },
+                xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                yaxis: { ...axisStyle, title: { text: 'Temperature (°C)' } },
               }}
               style={{ width: '100%', height: '100%' }}
               useResizeHandler
@@ -200,14 +323,14 @@ export default function ResultsPanel({ results, onClose }: Props) {
               data={[
                 ...valveTraces,
                 { x: [t[0], t[t.length-1]], y: [1,1], type: 'scatter' as const, mode: 'lines' as const,
-                  line: { color: '#f87171', dash: 'dot' as const, width: 1 }, name: 'Max', showlegend: false },
+                  line: { color: '#ef4444', dash: 'dot' as const, width: 1.5 }, name: 'Max (1.0)', showlegend: true },
                 { x: [t[0], t[t.length-1]], y: [0,0], type: 'scatter' as const, mode: 'lines' as const,
-                  line: { color: '#f87171', dash: 'dot' as const, width: 1 }, name: 'Min', showlegend: false },
+                  line: { color: '#ef4444', dash: 'dot' as const, width: 1.5 }, name: 'Min (0.0)', showlegend: true },
               ]}
               layout={{
                 ...commonLayout,
-                xaxis: { title: { text: 'Time (s)' },         gridcolor: '#334155', zerolinecolor: '#475569' },
-                yaxis: { title: { text: 'Opening (0–1)' }, range: [-0.05, 1.05], gridcolor: '#334155', zerolinecolor: '#475569' },
+                xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                yaxis: { ...axisStyle, title: { text: 'Opening (0–1)' }, range: [-0.05, 1.05] },
               }}
               style={{ width: '100%', height: '100%' }}
               useResizeHandler
@@ -222,10 +345,9 @@ export default function ResultsPanel({ results, onClose }: Props) {
                   data={humidityTraces}
                   layout={{
                     ...commonLayout,
-                    title: { text: 'Specific humidity at the inlet of each heat exchanger', font: { size: 13, color: '#94a3b8' } },
-                    margin: { ...commonLayout.margin, t: 48 },
-                    xaxis: { title: { text: 'Time (s)' },                          gridcolor: '#334155', zerolinecolor: '#475569' },
-                    yaxis: { title: { text: 'Specific humidity (kg/kg dry air)' },  gridcolor: '#334155', zerolinecolor: '#475569' },
+                    title: { text: 'Specific humidity at heat exchanger inlets', font: { size: 13 } },
+                    xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                    yaxis: { ...axisStyle, title: { text: 'Specific humidity (kg/kg dry air)' } },
                   }}
                   style={{ width: '100%', height: '100%' }}
                   useResizeHandler
@@ -238,10 +360,9 @@ export default function ResultsPanel({ results, onClose }: Props) {
               ? <div style={{ color: '#94a3b8', padding: 24 }}>Junction data is only available in nonlinear mode, and only when the graph contains junctions.</div>
               : <div style={{ overflowY: 'auto', height: '100%', display: 'flex', flexDirection: 'column', gap: 16, padding: 8 }}>
                   {Object.entries(junctions).map(([jid, jd]) => {
+                    const inletColors = assignColors(jd.inlet_labels, colorScheme)
                     const inletColorMap: Record<string, string> = {}
-                    jd.inlet_ids.forEach((src, i) => {
-                      inletColorMap[src] = pickColor(jd.inlet_labels[i], i)
-                    })
+                    jd.inlet_ids.forEach((src, i) => { inletColorMap[src] = inletColors[i] })
                     const outletColor = '#f59e0b'
 
                     const tempTraces = [
@@ -282,8 +403,8 @@ export default function ResultsPanel({ results, onClose }: Props) {
                             data={tempTraces}
                             layout={{ ...commonLayout,
                               margin: { t: 24, r: 12, b: 40, l: 60 },
-                              xaxis: { title: { text: 'Time (s)' },          gridcolor: '#334155', zerolinecolor: '#475569' },
-                              yaxis: { title: { text: 'Temperature (°C)' },  gridcolor: '#334155', zerolinecolor: '#475569' },
+                              xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                              yaxis: { ...axisStyle, title: { text: 'Temperature (°C)' } },
                             }}
                             style={{ flex: 1, height: 220 }}
                             useResizeHandler
@@ -293,8 +414,8 @@ export default function ResultsPanel({ results, onClose }: Props) {
                             data={humTraces}
                             layout={{ ...commonLayout,
                               margin: { t: 24, r: 12, b: 40, l: 60 },
-                              xaxis: { title: { text: 'Time (s)' },                         gridcolor: '#334155', zerolinecolor: '#475569' },
-                              yaxis: { title: { text: 'Specific humidity (kg/kg)' }, gridcolor: '#334155', zerolinecolor: '#475569' },
+                              xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                              yaxis: { ...axisStyle, title: { text: 'Specific humidity (kg/kg)' } },
                             }}
                             style={{ flex: 1, height: 220 }}
                             useResizeHandler
@@ -379,8 +500,8 @@ export default function ResultsPanel({ results, onClose }: Props) {
                   layout={{
                     ...commonLayout,
                     margin: { t: 10, r: 20, b: 50, l: 60 },
-                    xaxis: { title: { text: 'Real' },      gridcolor: '#334155', zerolinecolor: '#94a3b8' },
-                    yaxis: { title: { text: 'Imaginary' }, gridcolor: '#334155', zerolinecolor: '#94a3b8' },
+                    xaxis: { ...axisStyle, title: { text: 'Real' } },
+                    yaxis: { ...axisStyle, title: { text: 'Imaginary' } },
                   }}
                   style={{ width: '100%', height: 280 }}
                   useResizeHandler
