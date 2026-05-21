@@ -54,8 +54,8 @@ hvac._export_state_space(data_dir / "HVAC_model.mat")
 COMPARE_CONTROLLERS       = True   # True: overlay both in one 2×1 layout
 USE_DISTURBANCE_REJECTION = False   # Used when COMPARE_CONTROLLERS = False
 USE_BRYSON                = False    # Only used for LQR (not compatible with LMI design)
-CASE_DISTURBANCE          = 1       # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined, 5: Step change in T_in
-PLOT_OMEGA                = False   # True: add a third subplot with omega per controller
+CASE_DISTURBANCE          = 5       # 0: All constant, 1: Temp, 2: RH, 3: Flow, 4: All combined, 5: Step change in T_in
+PLOT_OMEGA                = True   # True: add a third subplot with omega per controller
 
 # ── Dimensions ────────────────────────────────────────────────────────────────
 K = hvac._lin_components[0].K
@@ -121,7 +121,7 @@ def d(t):
             volume_flow_wet_air = flow_base + 0.5 * flow_base * np.cos(2 * np.pi * t / (t_day / 2))
         case 4:
             shift_t = t - 54000
-            T_in = (23
+            T_in = (28
                     + 6   * np.cos(2 * np.pi * shift_t / 86400)
                     + 1.6 * np.cos(2 * np.pi * shift_t / 43200)
                     + 0.5 * np.cos(2 * np.pi * shift_t / 28800)
