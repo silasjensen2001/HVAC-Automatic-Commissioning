@@ -58,20 +58,30 @@ class BaseStateFeedbackController(ABC):
         return ode
 
     @classmethod
-    def cost_matrices(
-        cls, plant, Q_scale: float = 1.0, Qi_scale: float = 1.0, R_scale: float = 1.0, use_disturbance_rejection: bool = False
-    ) -> tuple[np.ndarray, np.ndarray]:
-        n = plant.A.shape[0]
-        m = plant.B_u.shape[1]
-        p = plant.C.shape[0]
-        if use_disturbance_rejection:
-            Q = np.block([
-                [Q_scale * np.eye(n), np.zeros((n, p))],
-                [np.zeros((p, n)),      Qi_scale * np.eye(p)]
-            ])
-            return Q, np.eye(m) * R_scale
-        else:
-            return np.eye(n + p) * Q_scale, np.eye(m) * R_scale
+    def cost_matrices(cls, plant, Q_air_temp: float, Q_water_temp: float, Q_i: float, R_u: float) -> tuple[np.ndarray, np.ndarray]:
+
+        n = plant.A.shape[0]   # Expected: 20
+        m = plant.B_u.shape[1] # Expected: 2
+        p = plant.C.shape[0]   # Expected: 2
+        
+        # Calculate the size of each state block (5 states each when n=20)
+        chunk = n // 4
+        
+        # Construct the diagonal vector matching your specific pattern
+        # (5x Q_air, 5x Q_water, 5x Q_air, 5x Q_water, 2x Q_i)
+        q_diag = np.concatenate([
+            np.full(chunk, Q_air_temp),
+            np.full(chunk, Q_water_temp),
+            np.full(chunk, Q_air_temp),
+            np.full(chunk, Q_water_temp),
+            np.full(p, Q_i)
+        ])
+        
+        # Generate the full Q and R matrices
+        Q = np.diag(q_diag)
+        R = np.eye(m) * R_u
+        
+        return Q, R
 
     @classmethod
     def cost_bryson(
