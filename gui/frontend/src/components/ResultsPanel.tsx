@@ -5,6 +5,17 @@ import type { SimResults, SimMetrics } from '../types'
 
 const DEFAULT_HEIGHT = 380
 
+function downloadCsv(filename: string, headers: string[], rows: (number | string)[][]) {
+  const escape = (v: number | string) =>
+    typeof v === 'number' ? v.toPrecision(10) : `"${String(v).replace(/"/g, '""')}"`
+  const csv = [headers.join(','), ...rows.map(r => r.map(escape).join(','))].join('\n')
+  const blob = new Blob([csv], { type: 'text/csv' })
+  const url  = URL.createObjectURL(blob)
+  const a    = document.createElement('a')
+  a.href = url; a.download = filename; a.click()
+  URL.revokeObjectURL(url)
+}
+
 function downloadGains(metrics: SimMetrics, rowLabels: string[], colLabels: string[]) {
   const payload = {
     actuated_ids:  metrics.actuated_ids,
@@ -61,7 +72,7 @@ function sampleColormap(anchors: string[], t: number): string {
 type NodeType = 'cooler' | 'heater' | 'other'
 
 const TYPE_RANGES: Record<Exclude<ColorScheme, 'default'>, Record<NodeType, [number, number]>> = {
-  viridis:  { cooler: [0.05, 0.18], heater: [0.80, 0.95], other: [0.42, 0.58] },
+  viridis:  { cooler: [0.28, 0.45], heater: [0.80, 0.95], other: [0.55, 0.70] },
   plasma:   { cooler: [0.05, 0.18], heater: [0.80, 0.95], other: [0.42, 0.58] },
   coolwarm: { cooler: [0.05, 0.20], heater: [0.80, 0.95], other: [0.45, 0.55] },
 }
@@ -103,7 +114,7 @@ interface Props {
   theme?: 'dark' | 'light'
 }
 
-type Tab = 'temperatures' | 'valves' | 'humidity' | 'junctions' | 'metrics'
+type Tab = 'temperatures' | 'valves' | 'humidity' | 'junctions' | 'metrics' | 'controller'
 
 export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props) {
   const [tab,           setTab]           = useState<Tab>('temperatures')
@@ -113,7 +124,7 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
   const [exporting,     setExporting]     = useState(false)
 
   const handleMatplotlibExport = async () => {
-    if (tab === 'metrics') return
+    if (tab === 'metrics' || tab === 'controller') return
     setExporting(true)
     try {
       const resp = await axios.post('http://localhost:8000/export_plot',
@@ -197,6 +208,33 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
     line: { color: humidityColors[i], width: 2 },
   }))
 
+  // ── Control-effort RMSE ───────────────────────────────────────────────────────
+  // Numerically differentiate each valve signal (central differences, with
+  // forward/backward at the endpoints), then compute RMS of dv/dt over the
+  // full simulation window.  This quantifies valve activity: a high value means
+  // the valve was moving fast / erratically; a low value means smooth control.
+  const valveEffortRmse: { label: string; rmse: number }[] = valveEntries.map(([, series]) => {
+    const v = series.y
+    const n = v.length
+    if (n < 2) return { label: series.label, rmse: 0 }
+
+    // dv/dt via central differences
+    const dvdt = new Array<number>(n)
+    dvdt[0]     = (v[1]     - v[0])         / (t[1]     - t[0])
+    dvdt[n - 1] = (v[n - 1] - v[n - 2])     / (t[n - 1] - t[n - 2])
+    for (let i = 1; i < n - 1; i++) {
+      dvdt[i] = (v[i + 1] - v[i - 1]) / (t[i + 1] - t[i - 1])
+    }
+
+    // Trapezoidal integral of (dv/dt)^2
+    let integral = 0
+    for (let i = 0; i < n - 1; i++) {
+      integral += 0.5 * (dvdt[i] ** 2 + dvdt[i + 1] ** 2) * (t[i + 1] - t[i])
+    }
+    const T = t[n - 1] - t[0]
+    return { label: series.label, rmse: T > 0 ? Math.sqrt(integral / T) : 0 }
+  })
+
   // ── Metrics ───────────────────────────────────────────────────────────────────
   const ssRows    = Object.values(metrics.steady_state)
   const KI        = metrics.K_I
@@ -209,6 +247,73 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
     y: metrics.cl_eigenvalues.map(e => e.im),
     type: 'scatter' as const, mode: 'markers' as const,
     name: 'CL poles', marker: { color: '#6366f1', size: 8, symbol: 'x' as const },
+  }
+
+  // ── CSV exports ───────────────────────────────────────────────────────────────
+  const exportTemperatures = () => {
+    const keys = Object.keys(outputs)
+    const headers = ['time_s', 'd_signal_C', ...keys.map(k => `${outputs[k].label}_C`), ...keys.map(k => `${outputs[k].label}_ref_C`)]
+    const rows = t.map((ti, i) => [ti, d_signal[i], ...keys.map(k => outputs[k].y[i]), ...keys.map(k => outputs[k].ref)])
+    downloadCsv('hvac_temperatures.csv', headers, rows)
+  }
+
+  const exportValves = () => {
+    const keys = Object.keys(valves)
+    const headers = ['time_s', ...keys.map(k => `${valves[k].label}_opening`)]
+    const rows = t.map((ti, i) => [ti, ...keys.map(k => valves[k].y[i])])
+    downloadCsv('hvac_valves.csv', headers, rows)
+  }
+
+  const exportHumidity = () => {
+    const keys = Object.keys(humidity ?? {})
+    const headers = ['time_s', ...keys.map(k => humidity[k].label + '_kg_per_kg')]
+    const rows = t.map((ti, i) => [ti, ...keys.map(k => humidity[k].y[i])])
+    downloadCsv('hvac_humidity.csv', headers, rows)
+  }
+
+  const exportJunction = (jid: string) => {
+    const jd = junctions[jid]
+    const inletTempHeaders = jd.inlet_ids.map(src => `${jd.inlet_labels[jd.inlet_ids.indexOf(src)]}_T_C`)
+    const inletHumHeaders  = jd.inlet_ids.map(src => `${jd.inlet_labels[jd.inlet_ids.indexOf(src)]}_hum_kg_per_kg`)
+    const headers = ['time_s', ...inletTempHeaders, 'mixed_outlet_T_C', ...inletHumHeaders, 'mixed_outlet_hum_kg_per_kg']
+    const rows = t.map((ti, i) => [
+      ti,
+      ...jd.inlet_ids.map(src => jd.inlet_temperatures[src][i]),
+      jd.outlet_temperatures[i],
+      ...jd.inlet_ids.map(src => jd.inlet_specific_humidities[src][i]),
+      jd.outlet_specific_humidities[i],
+    ])
+    downloadCsv(`hvac_junction_${jd.label.replace(/\s+/g, '_')}.csv`, headers, rows)
+  }
+
+  const exportAll = () => {
+    const outKeys = Object.keys(outputs)
+    const valKeys = Object.keys(valves)
+    const humKeys = Object.keys(humidity ?? {})
+    const headers = [
+      'time_s', 'd_signal_C',
+      ...outKeys.map(k => `T_${outputs[k].label}_C`),
+      ...outKeys.map(k => `T_${outputs[k].label}_ref_C`),
+      ...valKeys.map(k => `valve_${valves[k].label}`),
+      ...humKeys.map(k => `hum_${humidity[k].label}_kg_per_kg`),
+    ]
+    const rows = t.map((ti, i) => [
+      ti, d_signal[i],
+      ...outKeys.map(k => outputs[k].y[i]),
+      ...outKeys.map(k => outputs[k].ref),
+      ...valKeys.map(k => valves[k].y[i]),
+      ...humKeys.map(k => humidity[k].y[i]),
+    ])
+    downloadCsv('hvac_all_data.csv', headers, rows)
+    // Also export each junction if present
+    Object.keys(junctions ?? {}).forEach(jid => exportJunction(jid))
+  }
+
+  const exportBtnStyle: React.CSSProperties = {
+    background: 'var(--bg-deepest)', border: '1px solid var(--bg-mid)',
+    color: 'var(--text-sec)', borderRadius: 4, fontSize: 11,
+    padding: '4px 12px', cursor: 'pointer', alignSelf: 'flex-end',
+    margin: '4px 0 2px',
   }
 
   const isLight = theme === 'light'
@@ -252,7 +357,7 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
 
       <div className="results-header">
         <div className="tab-bar">
-          {(['temperatures', 'valves', 'humidity', 'junctions', 'metrics'] as Tab[]).map(tabName => (
+          {(['temperatures', 'valves', 'humidity', 'junctions', 'metrics', 'controller'] as Tab[]).map(tabName => (
             <button
               key={tabName}
               className={`tab-btn${tab === tabName ? ' tab-active' : ''}`}
@@ -277,7 +382,18 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
             <option value="plasma">Plasma</option>
             <option value="coolwarm">Coolwarm</option>
           </select>
-          {tab !== 'metrics' && (
+          <button
+            onClick={exportAll}
+            title="Export all time-series data as CSV (+ one CSV per junction)"
+            style={{
+              background: 'var(--bg-deepest)', border: '1px solid var(--bg-mid)',
+              color: 'var(--text-sec)', borderRadius: 4, fontSize: 11,
+              padding: '2px 8px', cursor: 'pointer',
+            }}
+          >
+            ↓ Export all CSV
+          </button>
+          {tab !== 'metrics' && tab !== 'controller' && (
             <button
               onClick={handleMatplotlibExport}
               disabled={exporting}
@@ -305,54 +421,57 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
       {!collapsed && (
         <div className="results-body">
           {tab === 'temperatures' && (
-            <Plot
-              data={[disturbanceTrace, ...tempTraces]}
-              layout={{
-                ...commonLayout,
-                xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
-                yaxis: { ...axisStyle, title: { text: 'Temperature (°C)' } },
-              }}
-              style={{ width: '100%', height: '100%' }}
-              useResizeHandler
-              config={{ responsive: true }}
-            />
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              <Plot
+                data={[disturbanceTrace, ...tempTraces]}
+                layout={{
+                  ...commonLayout,
+                  xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                  yaxis: { ...axisStyle, title: { text: 'Temperature (°C)' } },
+                }}
+                style={{ width: '100%', flex: 1, minHeight: 0 }}
+                useResizeHandler
+                config={{ responsive: true }}
+              />
+              <button style={exportBtnStyle} onClick={exportTemperatures}>↓ Export data</button>
+            </div>
           )}
 
           {tab === 'valves' && (
-            <Plot
-              data={[
-                ...valveTraces,
-                { x: [t[0], t[t.length-1]], y: [1,1], type: 'scatter' as const, mode: 'lines' as const,
-                  line: { color: '#ef4444', dash: 'dot' as const, width: 1.5 }, name: 'Max (1.0)', showlegend: true },
-                { x: [t[0], t[t.length-1]], y: [0,0], type: 'scatter' as const, mode: 'lines' as const,
-                  line: { color: '#ef4444', dash: 'dot' as const, width: 1.5 }, name: 'Min (0.0)', showlegend: true },
-              ]}
-              layout={{
-                ...commonLayout,
-                xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
-                yaxis: { ...axisStyle, title: { text: 'Opening (0–1)' }, range: [-0.05, 1.05] },
-              }}
-              style={{ width: '100%', height: '100%' }}
-              useResizeHandler
-              config={{ responsive: true }}
-            />
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              <Plot
+                data={valveTraces}
+                layout={{
+                  ...commonLayout,
+                  xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                  yaxis: { ...axisStyle, title: { text: 'Opening (0–1)' }, range: [0, 1], autorange: false },
+                }}
+                style={{ width: '100%', flex: 1, minHeight: 0 }}
+                useResizeHandler
+                config={{ responsive: true }}
+              />
+              <button style={exportBtnStyle} onClick={exportValves}>↓ Export data</button>
+            </div>
           )}
 
           {tab === 'humidity' && (
             humidityTraces.length === 0
               ? <div style={{ color: '#94a3b8', padding: 24 }}>Humidity data is only available in nonlinear mode.</div>
-              : <Plot
-                  data={humidityTraces}
-                  layout={{
-                    ...commonLayout,
-                    title: { text: 'Specific humidity at heat exchanger inlets', font: { size: 13 } },
-                    xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
-                    yaxis: { ...axisStyle, title: { text: 'Specific humidity (kg/kg dry air)' } },
-                  }}
-                  style={{ width: '100%', height: '100%' }}
-                  useResizeHandler
-                  config={{ responsive: true }}
-                />
+              : <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+                  <Plot
+                    data={humidityTraces}
+                    layout={{
+                      ...commonLayout,
+                      title: { text: 'Specific humidity at heat exchanger inlets', font: { size: 13 } },
+                      xaxis: { ...axisStyle, title: { text: 'Time (s)' } },
+                      yaxis: { ...axisStyle, title: { text: 'Specific humidity (kg/kg dry air)' } },
+                    }}
+                    style={{ width: '100%', flex: 1, minHeight: 0 }}
+                    useResizeHandler
+                    config={{ responsive: true }}
+                  />
+                  <button style={exportBtnStyle} onClick={exportHumidity}>↓ Export data</button>
+                </div>
           )}
 
           {tab === 'junctions' && (
@@ -395,8 +514,9 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
 
                     return (
                       <div key={jid}>
-                        <div style={{ color: '#e2e8f0', fontWeight: 600, marginBottom: 4, paddingLeft: 4 }}>
-                          Junction: {jd.label}
+                        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 4, paddingLeft: 4 }}>
+                          <span style={{ color: '#e2e8f0', fontWeight: 600 }}>Junction: {jd.label}</span>
+                          <button style={{ ...exportBtnStyle, margin: '0 0 0 auto' }} onClick={() => exportJunction(jid)}>↓ Export data</button>
                         </div>
                         <div style={{ display: 'flex', gap: 8 }}>
                           <Plot
@@ -455,6 +575,38 @@ export default function ResultsPanel({ results, onClose, theme = 'dark' }: Props
                 <p className="metric-note">Condition number: {metrics.condition_number.toExponential(3)}</p>
               </div>
 
+              {/* Valve control effort */}
+              <div className="metric-card">
+                <h4 className="metric-title">Valve control effort (RMS of dv/dt)  —  lower = smoother</h4>
+                <Plot
+                  data={[{
+                    type: 'bar' as const,
+                    orientation: 'h' as const,
+                    x: valveEffortRmse.map(e => e.rmse),
+                    y: valveEffortRmse.map(e => e.label),
+                    text: valveEffortRmse.map(e => e.rmse.toExponential(3)),
+                    textposition: 'auto' as const,
+                    insidetextanchor: 'start' as const,
+                    marker: { color: valveEffortRmse.map((_, i) => valveColors[i] ?? '#6366f1') },
+                    hovertemplate: '%{y}: %{x:.4e} s⁻¹<extra></extra>',
+                  } as never]}
+                  layout={{
+                    ...commonLayout,
+                    margin: { t: 10, r: 120, b: 50, l: 100 },
+                    xaxis: { ...axisStyle, title: { text: 'RMS of dv/dt  (s⁻¹)' } },
+                    yaxis: { ...axisStyle, automargin: true, autorange: 'reversed' },
+                    bargap: 0.35,
+                  }}
+                  style={{ width: '100%', height: 220 }}
+                  useResizeHandler
+                  config={{ responsive: true }}
+                />
+              </div>
+            </div>
+          )}
+
+          {tab === 'controller' && (
+            <div className="metrics-grid">
               {/* K_I heatmap */}
               <div className="metric-card">
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>

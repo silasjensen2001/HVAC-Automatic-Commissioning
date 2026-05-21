@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Any, Literal
 import traceback
 
-from simulate import run_simulation
+from simulate import run_simulation, get_system_info
 from export_plot import render_temperatures, render_valves, render_humidity, render_junctions
 
 app = FastAPI(title="HVAC Commissioning API")
@@ -52,6 +52,21 @@ async def export_plot(req: ExportPlotRequest):
         png = renderers[req.tab](req.data, req.scheme, req.title_suffix)
         return Response(content=png, media_type="image/png",
                         headers={"Content-Disposition": f'attachment; filename="hvac_{req.tab}.png"'})
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+
+
+class SystemInfoRequest(BaseModel):
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    sim_params: dict[str, Any] = {}
+
+
+@app.post("/system_info")
+async def system_info_endpoint(req: SystemInfoRequest):
+    try:
+        result = get_system_info(req.nodes, req.edges, req.sim_params)
+        return result
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
 

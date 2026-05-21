@@ -80,9 +80,9 @@ function nearestDownstreamFan(startId: string, allNodes: Node[], allEdges: Edge[
   return null
 }
 import { defaultNodes, defaultEdges, getDefaultNodeData } from './defaultTopology'
-import { runSimulation } from './api'
+import { runSimulation, fetchSystemInfo } from './api'
 import { validateGraph, type GraphWarning } from './validateGraph'
-import type { SimParams, SimResults } from './types'
+import type { SimParams, SimResults, SystemInfo } from './types'
 import './index.css'
 
 function loadFromStorage<T>(key: string, fallback: T): T {
@@ -117,6 +117,8 @@ export default function App() {
 
   const [simParams, setSimParams]       = useState<SimParams>(loadFromStorage('hvac_simParams', defaultSimParams))
   const [simResults, setSimResults]     = useState<SimResults | null>(null)
+  const [systemInfo, setSystemInfo]     = useState<SystemInfo | null>(null)
+  const [isFetchingInfo, setIsFetchingInfo] = useState(false)
   const [isLoading, setIsLoading]       = useState(false)
   const [error, setError]               = useState<string | null>(null)
   const [showResults, setShowResults]   = useState(false)
@@ -584,7 +586,21 @@ export default function App() {
     }, 'image/png')
   }, [theme])
 
-  const handleSimulate = async () => {
+  const handleFetchSystemInfo = async () => {
+    setIsFetchingInfo(true)
+    setError(null)
+    try {
+      const info = await fetchSystemInfo(nodes, edges, simParams)
+      setSystemInfo(info)
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setError(`System info: ${msg}`)
+    } finally {
+      setIsFetchingInfo(false)
+    }
+  }
+
+  const handleSimulate = async (extraParams?: Partial<SimParams>) => {
     // Validate topology first
     const w = validateGraph(nodes, edges)
     setWarnings(w)
@@ -594,11 +610,12 @@ export default function App() {
     }
     if (w.length > 0) setShowWarnings(true)
 
+    const params = extraParams ? { ...simParams, ...extraParams } : simParams
     abortController.current = new AbortController()
     setIsLoading(true)
     setError(null)
     try {
-      const results = await runSimulation(nodes, edges, simParams, abortController.current.signal)
+      const results = await runSimulation(nodes, edges, params, abortController.current.signal)
       setSimResults(results)
       setShowResults(true)
     } catch (err: unknown) {
@@ -666,6 +683,9 @@ export default function App() {
           onSimParamsChange={setSimParams}
           onSimulate={handleSimulate}
           isLoading={isLoading}
+          systemInfo={systemInfo}
+          onFetchSystemInfo={handleFetchSystemInfo}
+          isFetchingInfo={isFetchingInfo}
         />
 
         <div

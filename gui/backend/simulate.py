@@ -185,6 +185,34 @@ def _react_flow_to_hvac_nodes(rf_nodes: list, rf_edges: list) -> list:
     return hvac_nodes
 
 
+def get_system_info(rf_nodes: list, rf_edges: list, sim_params: dict) -> dict:
+    outdoor_node = next((n for n in rf_nodes if n["type"] == "outdoor_air"), None)
+    if outdoor_node:
+        T_fresh_C = float(outdoor_node["data"].get("T_fresh", 23.0))
+    else:
+        T_fresh_C = float(sim_params.get("T_fresh", 23.0))
+    T_fresh_K = T_fresh_C + 273.15
+
+    hvac_nodes = _react_flow_to_hvac_nodes(rf_nodes, rf_edges)
+    hvac = HVAC(nodes=hvac_nodes, T_fresh=T_fresh_K, mode="linear", const_disturbance=T_fresh_K)
+
+    n = hvac.A.shape[0]
+    m = hvac.B_u.shape[1]
+    p = hvac.C.shape[0]
+    Q_scale = float(sim_params.get("Q_scale", 5.0))
+    R_scale = float(sim_params.get("R_scale", 800.0))
+
+    return {
+        "n_states": n,
+        "n_inputs": m,
+        "n_outputs": p,
+        "q_size": n + p,
+        "r_size": m,
+        "q_diag_default": [Q_scale] * (n + p),
+        "r_diag_default": [R_scale] * m,
+    }
+
+
 def run_simulation(rf_nodes: list, rf_edges: list, sim_params: dict) -> dict:
     # Extract outdoor air settings from the outdoor_air canvas node if present
     outdoor_node = next((n for n in rf_nodes if n["type"] == "outdoor_air"), None)
@@ -216,7 +244,49 @@ def run_simulation(rf_nodes: list, rf_edges: list, sim_params: dict) -> dict:
         const_disturbance=T_fresh_K,
     )
 
-    Q, R = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_scale, R_scale=R_scale)
+    # Build Q and R matrices — advanced (per-element) or simple (scaled identity)
+    use_advanced = bool(sim_params.get("use_advanced_qr", False))
+    n_aug = hvac.A.shape[0] + hvac.C.shape[0]
+    m_sys = hvac.B_u.shape[1]
+
+    Q_diag_lqr = sim_params.get("Q_diag_lqr")
+    R_diag_lqr = sim_params.get("R_diag_lqr")
+    Q_diag_dr  = sim_params.get("Q_diag_dr")
+    R_diag_dr  = sim_params.get("R_diag_dr")
+
+    if use_advanced and Q_diag_lqr and R_diag_lqr:
+        if len(Q_diag_lqr) != n_aug:
+            raise ValueError(
+                f"Advanced Q (LQR) has {len(Q_diag_lqr)} values but system needs {n_aug} "
+                f"(n_states={hvac.A.shape[0]}, n_outputs={hvac.C.shape[0]}). "
+                f"Click 'Get dimensions' to refresh the correct size."
+            )
+        if len(R_diag_lqr) != m_sys:
+            raise ValueError(
+                f"Advanced R (LQR) has {len(R_diag_lqr)} values but system needs {m_sys} inputs."
+            )
+        Q_lqr = np.diag(Q_diag_lqr)
+        R_lqr = np.diag(R_diag_lqr)
+    else:
+        Q_lqr, R_lqr = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_scale, R_scale=R_scale)
+
+    if use_advanced and Q_diag_dr and R_diag_dr:
+        if len(Q_diag_dr) != n_aug:
+            raise ValueError(
+                f"Advanced Q (DR) has {len(Q_diag_dr)} values but system needs {n_aug} "
+                f"(n_states={hvac.A.shape[0]}, n_outputs={hvac.C.shape[0]}). "
+                f"Click 'Get dimensions' to refresh the correct size."
+            )
+        if len(R_diag_dr) != m_sys:
+            raise ValueError(
+                f"Advanced R (DR) has {len(R_diag_dr)} values but system needs {m_sys} inputs."
+            )
+        Q_dr = np.diag(Q_diag_dr)
+        R_dr = np.diag(R_diag_dr)
+    else:
+        Q_dr, R_dr = StateFeedbackController.cost_matrices(hvac, Q_scale=Q_scale, R_scale=R_scale)
+
+    Q, R = (Q_dr, R_dr) if controller_type == "lmi" else (Q_lqr, R_lqr)
 
     if controller_type == "lmi":
         # When const_disturbance is set, _assemble_system folds B_d into the

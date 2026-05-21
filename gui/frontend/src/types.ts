@@ -63,6 +63,21 @@ export interface SimParams {
   R_scale: number
   model_mode: 'linear' | 'nonlinear'
   controller_type: 'lqr' | 'lmi'
+  use_advanced_qr?: boolean
+  Q_diag_lqr?: number[]
+  R_diag_lqr?: number[]
+  Q_diag_dr?: number[]
+  R_diag_dr?: number[]
+}
+
+export interface SystemInfo {
+  n_states: number
+  n_inputs: number
+  n_outputs: number
+  q_size: number
+  r_size: number
+  q_diag_default: number[]
+  r_diag_default: number[]
 }
 
 export interface OutputSeries {
