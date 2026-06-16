@@ -7,11 +7,15 @@ from scipy.optimize import root
 
 # - - - - - - - - - - - - - - - - HVAC - - - - - - - - - - - - - - - -
 class HVAC:
-    def __init__(self, configs: list, mode: str = "linear", const_disturbance: float = None):
+    def __init__(self, nodes: list, T_fresh: float, mode: str = "linear", const_disturbance: float = None):
         """
         Args:
-            configs: Ordered list of parameter dicts for each heat exchanger.
-                     Air flows through them in series: configs[0] → configs[1] → ...
+            nodes:   Ordered list of node dicts describing the air-flow graph.
+                     Each dict must contain:
+                       "id"           — unique string identifier
+                       "type"         — "cooler" | "heater" | "airduct"
+                       "config"       - configuration parameters
+                       "input"        — id of upstream node (optional; defaults to serial order)       
             mode:    "linear"    — simulate with linearised state-space matrices.
                      "nonlinear" — simulate with full nonlinear ODEs.
                      The linear model (A, B_u, B_d, C, coordinate_shift) is always
@@ -20,14 +24,33 @@ class HVAC:
         if mode not in ("linear", "nonlinear"):
             raise ValueError(f"mode must be 'linear' or 'nonlinear', got {mode!r}")
 
-        self.configs = configs
-        self.mode    = mode
+        self.nodes             = nodes
+        self.T_fresh           = T_fresh
+        self.mode              = mode
         self.const_disturbance = const_disturbance
 
-        # Linear models. Always constructed as they are needed for LMI design and .mat export)
-        self._lin_components  = [LinearHeatExchanger(**cfg) for cfg in configs]
+        T_in_map = self._propagate_operating_temps()
+
+        self._lin_components = []
+        for node in nodes:
+            ntype  = node["type"]
+            config = node.get("config", {})
+            T_in   = T_in_map[node["id"]]
+            if ntype in ("cooler", "heater"):
+                T_out_target = config["T_out_target"]
+                params = {k: v for k, v in config.items() if k != "T_out_target"}
+                self._lin_components.append(
+                    LinearHeatExchanger(T_in_op=T_in, T_out_target=T_out_target, **params)
+                )
+            elif ntype == "airduct":
+                self._lin_components.append(AirDuctModel(**config))
+
         self.total_states     = sum(c.num_states for c in self._lin_components)
         self.coordinate_shift = np.zeros(self.total_states)
+
+        # Must be set before _assemble_system, which uses both
+        self._state_node_ids = [n["id"] for n in nodes if n["type"] != "junction"]
+        self._inlet_sources  = self._build_inlet_sources()
 
         if self.const_disturbance is not None:
             self.A, self.B_u, self.C = self._assemble_system()
@@ -38,7 +61,15 @@ class HVAC:
 
         # Nonlinear components — only built when needed
         if mode == "nonlinear":
-            self._nl_components = [NonlinearHeatExchanger(**cfg) for cfg in configs]
+            self._nl_components = []
+            for node in nodes:
+                ntype  = node["type"]
+                config = node.get("config", {})
+                if ntype in ("cooler", "heater"):
+                    params = {k: v for k, v in config.items() if k != "T_out_target"}
+                    self._nl_components.append(NonlinearHeatExchanger(**params))
+                elif ntype == "airduct":
+                    self._nl_components.append(AirDuctModel(**config))
 
     def _export_state_space(self, file_path: str):
         data = {
@@ -53,43 +84,168 @@ class HVAC:
 
         sio.savemat(file_path, data)
 
+    def _build_inlet_sources(self) -> list:
+        """
+        For every state-bearing node (non-junction), describe where its air inlet comes from.
+        Returns one descriptor per entry in _lin_components / _nl_components:
+          ("external",)                     — d[0] (fresh air)
+          ("node", node_id)                 — outlet of another state-bearing node
+          ("junction", [(src_id, q), ...])  — flow-weighted mix; src_id is "external" or a node id
+        """
+        node_by_id  = {n["id"]: n for n in self.nodes}
+        serial_pred = {self.nodes[i]["id"]: self.nodes[i-1]["id"]
+                       for i in range(1, len(self.nodes))}
+
+        sources = []
+        for node in self.nodes:
+            if node["type"] == "junction":
+                continue
+
+            input_id = node.get("input") or serial_pred.get(node["id"])
+
+            if not input_id:
+                sources.append(("external",))
+            elif input_id == "external":
+                sources.append(("external",))
+            else:
+                upstream = node_by_id[input_id]
+                if upstream["type"] == "junction":
+                    inputs = upstream.get("config", {}).get("inputs", [])
+                    sources.append(("junction", inputs))
+                else:
+                    sources.append(("node", input_id))
+
+        return sources
+
+    def _propagate_operating_temps(self) -> dict:
+        """
+        Compute the air inlet temperature at the operating point for every node.
+
+        Two-pass strategy:
+          Pass 1 — HX T_outs are fixed (= T_out_target, independent of T_in).
+          Pass 2 — Duct and junction T_outs are resolved recursively from their
+                   upstream nodes.  Junctions mix multiple inputs by flow weight.
+                   Cycle detection guards against invalid topologies.
+
+        Returns {node_id: T_in_op}.
+        """
+        node_by_id  = {n["id"]: n for n in self.nodes}
+        serial_pred = {self.nodes[i]["id"]: self.nodes[i-1]["id"]
+                       for i in range(1, len(self.nodes))}
+
+        # Pass 1: HX T_outs are known immediately from their setpoints.
+        T_out = {"external": self.T_fresh}
+        for node in self.nodes:
+            if node["type"] in ("cooler", "heater"):
+                T_out[node["id"]] = node["config"]["T_out_target"]
+
+        # Pass 2: resolve ducts and junctions via memoised recursion.
+        def resolve(nid, visiting=None):
+            if nid in T_out:
+                return T_out[nid]
+            visiting = visiting or set()
+            if nid in visiting:
+                raise ValueError(f"Cycle detected resolving T_out for node '{nid}'.")
+            visiting.add(nid)
+
+            node   = node_by_id[nid]
+            ntype  = node["type"]
+            config = node.get("config", {})
+
+            if ntype == "junction":
+                inputs  = config.get("inputs", [])
+                total_q = sum(q for _, q in inputs)
+                T_out[nid] = sum(q * resolve(src, visiting) for src, q in inputs) / total_q
+            else:  # airduct — transparent at steady state
+                upstream   = node.get("input") or serial_pred.get(nid) or "external"
+                T_out[nid] = resolve(upstream, visiting)
+
+            return T_out[nid]
+
+        for node in self.nodes:
+            resolve(node["id"])
+
+        # Compute T_in for each state-bearing node.
+        T_in_map  = {}
+        T_current = self.T_fresh
+        for node in self.nodes:
+            nid      = node["id"]
+            input_id = node.get("input") or serial_pred.get(nid)
+
+            if node["type"] == "junction":
+                T_in_map[nid] = T_out[nid]   # junction has no state; T_in = mixed output
+            else:
+                tin = resolve(input_id) if input_id else T_current
+                T_in_map[nid] = tin
+
+            T_current = T_out[nid]
+
+        return T_in_map
+
     def _assemble_system(self):
         """
-        Assemble full block state-space from linear component instances.
-        Each component must expose: A, B_u, B_d, C, Offset
+        Assemble full block state-space using inlet_sources for air routing.
+
+        Inlet types handled:
+          "external"  → B_d contribution (fresh air disturbance)
+          "node"      → off-diagonal A block (serial coupling from upstream outlet)
+          "junction"  → weighted mix: external fraction → B_d,
+                        recirculated fraction → off-diagonal A block (feedback)
+
+        Components with is_actuated=False contribute no B_u column.
+        Components with is_output=False contribute no C row.
         """
+        n_actuated = sum(1 for c in self._lin_components if getattr(c, "is_actuated", True))
+        n_outputs  = sum(1 for c in self._lin_components if getattr(c, "is_output",   True))
+
         A      = np.zeros((self.total_states, self.total_states))
-        B_u    = np.zeros((self.total_states, len(self._lin_components)))
+        B_u    = np.zeros((self.total_states, n_actuated))
         B_d    = np.zeros((self.total_states, 1))
-        C      = np.zeros((len(self._lin_components), self.total_states))
+        C      = np.zeros((n_outputs, self.total_states))
         Offset = np.zeros((self.total_states, 1))
 
-        offset   = 0
-        prev_C   = None
-        prev_offset = None
-        prev_n   = None
+        # Build (offset, num_states, component) lookup keyed by node id
+        node_offsets = {}
+        off = 0
+        for nid, comp in zip(self._state_node_ids, self._lin_components):
+            node_offsets[nid] = (off, comp.num_states, comp)
+            off += comp.num_states
 
-        for comp_idx, component in enumerate(self._lin_components):
-            n = component.num_states
+        u_idx = 0
+        y_idx = 0
 
-            A[offset:offset+n, offset:offset+n] = component.A
+        for nid, comp, source in zip(self._state_node_ids, self._lin_components, self._inlet_sources):
+            off, n, _ = node_offsets[nid]
 
-            if prev_C is not None:
-                coupling = component.B_d @ prev_C
-                A[offset:offset+n, prev_offset:prev_offset+prev_n] = coupling
+            A[off:off+n, off:off+n] = comp.A
 
-            B_u[offset:offset+n, comp_idx:comp_idx+1] += component.B_u
+            if source[0] == "external":
+                B_d[off:off+n, :] += comp.B_d
 
-            if offset == 0:
-                B_d[offset:offset+n, :] += component.B_d
+            elif source[0] == "node":
+                src_off, src_n, src_comp = node_offsets[source[1]]
+                A[off:off+n, src_off:src_off+src_n] += comp.B_d @ src_comp.C
 
-            C[comp_idx, offset:offset+n] = component.C[0, :]
-            Offset[offset:offset+n, :]   += component.Offset
+            elif source[0] == "junction":
+                inputs  = source[1]
+                total_q = sum(q for _, q in inputs)
+                for src, q in inputs:
+                    alpha = q / total_q
+                    if src == "external":
+                        B_d[off:off+n, :] += alpha * comp.B_d
+                    else:
+                        src_off, src_n, src_comp = node_offsets[src]
+                        A[off:off+n, src_off:src_off+src_n] += alpha * comp.B_d @ src_comp.C
 
-            prev_C      = component.C
-            prev_offset = offset
-            prev_n      = n
-            offset      += n
+            if getattr(comp, "is_actuated", True):
+                B_u[off:off+n, u_idx:u_idx+1] += comp.B_u
+                u_idx += 1
+
+            if getattr(comp, "is_output", True):
+                C[y_idx, off:off+n] = comp.C[0, :]
+                y_idx += 1
+
+            Offset[off:off+n, :] += comp.Offset
 
         if self.const_disturbance is not None:
             Offset += B_d * self.const_disturbance
@@ -98,8 +254,6 @@ class HVAC:
         else:
             self._compute_frame_shift(A, Offset)
             return A, B_u, B_d, C
-
-  
 
     def _check_stability_and_rank(self, A: np.ndarray):
         eigenvalues = np.linalg.eigvals(A)
@@ -112,13 +266,23 @@ class HVAC:
         # PBH test: rank([λI - A, B]) = n for every eigenvalue λ of A.
         # Numerically stable for stiff systems unlike the matrix-power method.
         n = A.shape[0]
-        uncontrollable_modes = []
+        unstable_uncontrollable = []
+        stable_uncontrollable   = []
         for lam in np.linalg.eigvals(A):
             pbh = np.hstack([lam * np.eye(n) - A, B_u])
             if np.linalg.matrix_rank(pbh) < n:
-                uncontrollable_modes.append(lam)
-        if uncontrollable_modes:
-            raise ValueError(f"System is not controllable. {len(uncontrollable_modes)} uncontrollable mode(s): {uncontrollable_modes}")
+                if lam.real >= 0:
+                    unstable_uncontrollable.append(lam)
+                else:
+                    stable_uncontrollable.append(lam)
+        if stable_uncontrollable:
+            print(f"  [controllability] {len(stable_uncontrollable)} stable uncontrollable mode(s) "
+                  f"(will decay naturally): {[f'{l.real:.3f}' for l in stable_uncontrollable]}")
+        if unstable_uncontrollable:
+            raise ValueError(
+                f"System has {len(unstable_uncontrollable)} UNSTABLE uncontrollable mode(s) — "
+                f"cannot stabilise: {unstable_uncontrollable}"
+            )
 
     def _compute_frame_shift(self, A: np.ndarray, Offset: np.ndarray):
         self._check_stability_and_rank(A)
@@ -131,18 +295,224 @@ class HVAC:
         return x - self.coordinate_shift
 
     def _nonlinear_derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
-        T_air_in = d[0]
-        offset   = 0
-        parts    = []
-        for i, comp in enumerate(self._nl_components):
-            n    = comp.num_states
-            x_k  = x[offset:offset+n]
-            dxdt = comp.derivatives(x_k, u[i:i+1], np.array([T_air_in]))
-            parts.append(dxdt)
-            T_air_in = np.mean(x_k[:comp.K])   # outlet air → next component's inlet
-            offset  += n
-        return np.concatenate(parts)
-    
+        fresh_air_temperature = d[0]
+
+        # Specific humidity of the incoming fresh air, based on its temperature and configured relative humidity
+        reference_heat_exchanger    = next(c for c in self._nl_components if isinstance(c, NonlinearHeatExchanger))
+        fresh_air_specific_humidity = reference_heat_exchanger._omega(fresh_air_temperature, reference_heat_exchanger.relative_humidity_in_system)
+
+        def get_inlet_temperature(source, outlet_temperature_by_node):
+            """Return the air temperature entering a component, based on where its air comes from."""
+            if source[0] == "external":
+                return fresh_air_temperature
+            elif source[0] == "node":
+                return outlet_temperature_by_node[source[1]]
+            else:  # junction: flow-weighted average of all inlet streams
+                inlet_streams = source[1]
+                total_flow    = sum(flow for _, flow in inlet_streams)
+                return sum(
+                    flow * (fresh_air_temperature if upstream_id == "external" else outlet_temperature_by_node[upstream_id])
+                    for upstream_id, flow in inlet_streams
+                ) / total_flow
+
+        def get_inlet_specific_humidity(source, outlet_specific_humidity_by_node):
+            """Return the specific humidity of the air entering a component.
+            Falls back to fresh air omega for recirculation back-edges not yet processed."""
+            if source[0] == "external":
+                return fresh_air_specific_humidity
+            elif source[0] == "node":
+                return outlet_specific_humidity_by_node.get(source[1], fresh_air_specific_humidity)
+            else:  # junction: flow-weighted average of all inlet streams
+                inlet_streams = source[1]
+                total_flow    = sum(flow for _, flow in inlet_streams)
+                return sum(
+                    flow * (fresh_air_specific_humidity if upstream_id == "external"
+                            else outlet_specific_humidity_by_node.get(upstream_id, fresh_air_specific_humidity))
+                    for upstream_id, flow in inlet_streams
+                ) / total_flow
+
+        # Pre-pass: compute ALL outlet temperatures from the current state vector upfront.
+        # This must happen before the derivative loop because recirculation back-edges
+        # (e.g. a return duct feeding a junction) may reference nodes that come later
+        # in topological order — they would be missing from the dict if built incrementally.
+        outlet_temperature_by_node = {}
+        state_offset_pre = 0
+        for node_id, component in zip(self._state_node_ids, self._nl_components):
+            state_count = component.num_states
+            state_slice = x[state_offset_pre : state_offset_pre + state_count]
+            if isinstance(component, AirDuctModel):
+                outlet_temperature_by_node[node_id] = float(state_slice[-1])
+            else:
+                outlet_temperature_by_node[node_id] = float(np.mean(state_slice[:component.K]))
+            state_offset_pre += state_count
+
+        # Forward pass: propagate specific humidity and compute derivatives.
+        # Omega flows strictly forward, so topological order is sufficient.
+        # For recirculation back-edges not yet in the dict, fall back to fresh air omega.
+        outlet_specific_humidity_by_node = {}
+        derivative_parts                 = []
+        state_offset                     = 0
+        control_input_index              = 0
+
+        for node_id, component, inlet_source in zip(self._state_node_ids, self._nl_components, self._inlet_sources):
+            state_count = component.num_states
+            state_slice = x[state_offset : state_offset + state_count]
+
+            # --- Inlet conditions (from the upstream source) ---
+            inlet_temperature       = get_inlet_temperature(inlet_source, outlet_temperature_by_node)
+            inlet_specific_humidity = get_inlet_specific_humidity(inlet_source, outlet_specific_humidity_by_node)
+
+            # --- Outlet specific humidity ---
+            # Cooler: air leaves saturated (relative humidity = 1), so omega is determined by outlet temperature.
+            # Heater and duct: no moisture is added or removed, so specific humidity passes through unchanged.
+            if isinstance(component, NonlinearHeatExchanger) and component.type == "cooler":
+                outlet_specific_humidity_by_node[node_id] = component._omega(outlet_temperature_by_node[node_id], 1.0)
+            else:
+                outlet_specific_humidity_by_node[node_id] = inlet_specific_humidity
+
+            # --- Derivatives ---
+            if isinstance(component, AirDuctModel):
+                dxdt = component.derivatives(state_slice, inlet_temperature)
+            else:
+                dxdt = component.derivatives(state_slice, u[control_input_index : control_input_index + 1], np.array([inlet_temperature, inlet_specific_humidity]))
+                control_input_index += 1
+
+            derivative_parts.append(dxdt)
+            state_offset += state_count
+
+        return np.concatenate(derivative_parts)
+
+    def compute_inlet_specific_humidities(self, x: np.ndarray, fresh_air_temperature: float) -> dict:
+        """
+        Return {node_id: omega_in} for every heat exchanger, given the current state.
+        Used for post-processing humidity time series after simulation.
+        Only valid in nonlinear mode (requires self._nl_components).
+        """
+        _, outlet_omega = self._compute_outlet_states(x, fresh_air_temperature)
+
+        def get_omega_in(source):
+            if source[0] == "external":
+                return outlet_omega["external"]
+            elif source[0] == "node":
+                return outlet_omega.get(source[1], outlet_omega["external"])
+            else:
+                inlet_streams = source[1]
+                total_flow    = sum(flow for _, flow in inlet_streams)
+                return sum(
+                    flow * outlet_omega.get(uid, outlet_omega["external"])
+                    for uid, flow in inlet_streams
+                ) / total_flow
+
+        inlet_omega_by_node = {}
+        for node_id, component, source in zip(self._state_node_ids, self._nl_components, self._inlet_sources):
+            if isinstance(component, NonlinearHeatExchanger):
+                inlet_omega_by_node[node_id] = get_omega_in(source)
+
+        return inlet_omega_by_node
+
+    def _compute_outlet_states(self, x: np.ndarray, fresh_air_temperature: float) -> tuple[dict, dict]:
+        """
+        Shared helper: compute outlet temperature and specific humidity for every
+        state-bearing node from the current state vector.
+        Returns (outlet_temperature_by_node, outlet_specific_humidity_by_node),
+        both including an "external" entry for fresh air.
+        """
+        ref_comp                    = next(c for c in self._nl_components if isinstance(c, NonlinearHeatExchanger))
+        fresh_air_specific_humidity = ref_comp._omega(fresh_air_temperature, ref_comp.relative_humidity_in_system)
+
+        # Outlet temperatures — read directly from state vector (no ordering dependency)
+        outlet_temperature = {"external": fresh_air_temperature}
+        state_offset = 0
+        for node_id, component in zip(self._state_node_ids, self._nl_components):
+            state_count = component.num_states
+            state_slice = x[state_offset : state_offset + state_count]
+            if isinstance(component, AirDuctModel):
+                outlet_temperature[node_id] = float(state_slice[-1])
+            else:
+                outlet_temperature[node_id] = float(np.mean(state_slice[:component.K]))
+            state_offset += state_count
+
+        # Outlet specific humidities — two forward passes to handle recirculation back-edges.
+        # A single pass falls back to fresh air for back-edges (nodes not yet visited).
+        # The second pass uses the first pass's result for those back-edges, which is a
+        # much better approximation than fresh air for a recirculating system.
+        def _omega_pass(fallback_omega: dict) -> dict:
+            def get_omega_in(source, current_omega):
+                if source[0] == "external":
+                    return fresh_air_specific_humidity
+                elif source[0] == "node":
+                    uid = source[1]
+                    return current_omega.get(uid, fallback_omega.get(uid, fresh_air_specific_humidity))
+                else:
+                    inlet_streams = source[1]
+                    total_flow    = sum(flow for _, flow in inlet_streams)
+                    return sum(
+                        flow * (fresh_air_specific_humidity if uid == "external"
+                                else current_omega.get(uid, fallback_omega.get(uid, fresh_air_specific_humidity)))
+                        for uid, flow in inlet_streams
+                    ) / total_flow
+
+            result = {"external": fresh_air_specific_humidity}
+            for node_id, component, source in zip(self._state_node_ids, self._nl_components, self._inlet_sources):
+                omega_in = get_omega_in(source, result)
+                if isinstance(component, NonlinearHeatExchanger) and component.type == "cooler":
+                    result[node_id] = component._omega(outlet_temperature[node_id], 1.0)
+                else:
+                    result[node_id] = omega_in
+            return result
+
+        outlet_omega = _omega_pass(_omega_pass({"external": fresh_air_specific_humidity}))
+
+        return outlet_temperature, outlet_omega
+
+    def compute_junction_states(self, x: np.ndarray, fresh_air_temperature: float) -> dict:
+        """
+        Return mixing data for every junction node, given the current state.
+        Each entry contains, for each inlet stream, its temperature and specific humidity,
+        plus the flow-weighted mixed outlet values.
+
+        Returns:
+            {junction_id: {
+                "inputs":                     [(src_id, flow), ...],
+                "inlet_temperatures":         {src_id: T [K]},
+                "inlet_specific_humidities":  {src_id: omega [kg/kg]},
+                "outlet_temperature":         T_mixed [K],
+                "outlet_specific_humidity":   omega_mixed [kg/kg],
+            }}
+        """
+        outlet_temperature, outlet_omega = self._compute_outlet_states(x, fresh_air_temperature)
+
+        junctions = {}
+        for node in self.nodes:
+            if node["type"] != "junction":
+                continue
+            junction_id = node["id"]
+            inputs      = node["config"]["inputs"]  # [(src_id, flow), ...]
+            total_flow  = sum(flow for _, flow in inputs)
+
+            inlet_temperatures        = {}
+            inlet_specific_humidities = {}
+            mixed_temperature         = 0.0
+            mixed_specific_humidity   = 0.0
+
+            for src_id, flow in inputs:
+                t_in     = outlet_temperature.get(src_id, fresh_air_temperature)
+                omega_in = outlet_omega.get(src_id, outlet_omega["external"])
+                inlet_temperatures[src_id]        = t_in
+                inlet_specific_humidities[src_id] = omega_in
+                mixed_temperature       += flow * t_in
+                mixed_specific_humidity += flow * omega_in
+
+            junctions[junction_id] = {
+                "inputs":                    inputs,
+                "inlet_temperatures":        inlet_temperatures,
+                "inlet_specific_humidities": inlet_specific_humidities,
+                "outlet_temperature":        mixed_temperature / total_flow,
+                "outlet_specific_humidity":  mixed_specific_humidity / total_flow,
+            }
+
+        return junctions
+
     def derivatives(self, x: np.ndarray, u: np.ndarray, d: np.ndarray) -> np.ndarray:
         if self.mode == "linear":
             z = self._to_shifted_frame(x)
@@ -174,6 +544,8 @@ class BaseHeatExchanger(ABC):
     Disturbance vector: d = [T_in]
         T_in  : air inlet temperature           [K]
     """
+    is_actuated = True   # contributes a column to the global B_u
+    is_output   = True   # contributes a row to the global C
 
     def __init__(
         self,
@@ -277,22 +649,16 @@ class BaseHeatExchanger(ABC):
         """
 
 class LinearHeatExchanger(BaseHeatExchanger):
-    def __init__(self, **kwargs):
+    def __init__(self, T_in_op: float, T_out_target: float, **kwargs):
         super().__init__(**kwargs)
-        self._kwargs = kwargs  # store so we can spin up NonlinearHeatExchanger internally
+        self._kwargs = kwargs  # stored so we can spin up NonlinearHeatExchanger internally
 
-        self.theta_return_operation_point = None # will be set to return water temp at equilibrium in _construct_air_state_block()
-
-        if self.type == "heater":
-            self.valve_operation_point = 0.02 # [0-1] valve opening for water flow
-        else:
-            self.valve_operation_point = 0.353 # [0-1] valve opening for water flow 0.95 for 28°C inlet
-        
-        # Central difference parameters for linearization of air dynamics
+        self.theta_return_operation_point = None  # set by _find_valve_for_setpoint
+        self.valve_operation_point        = 0.3   # initial guess; overwritten below
         self.eps = 1e-5
-        self.equilibrium_initial_guess = 15 + 273.15
 
-        self.A, self.B_u, self.B_d, self.Offset, self.C  = self._construct_matrix_state_space()
+        self.A, self.B_u, self.B_d, self.Offset, self.C = \
+            self._construct_matrix_state_space(T_in_op, T_out_target)
 
     def _export_state_space(self, file_path: str):
         sio.savemat(file_path, {"A": self.A, "B_u": self.B_u, "B_d": self.B_d, "Offset": self.Offset, "C": self.C})
@@ -363,35 +729,55 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_water, B_water, offset_water
     
-    def _find_equilibrium(self, nonlinear: "NonlinearHeatExchanger", u_op: np.ndarray, d_op: np.ndarray) -> np.ndarray:
-        x0 = np.full(nonlinear.N, self.equilibrium_initial_guess)
-        result = root(lambda x: nonlinear.derivatives(x, u_op, d_op), x0)
+    def _find_valve_for_setpoint(self, nonlinear: "NonlinearHeatExchanger",
+                                 T_in: float, T_out_target: float, omega_in_op: float):
+        """
+        Given inlet temperature T_in and desired outlet temperature T_out_target,
+        find the valve position u and full equilibrium state x such that:
+            f(x, u, T_in) = 0   and   mean(x[:K]) = T_out_target   (mean of parallel air segments)
+        """
+        N, K = nonlinear.N, nonlinear.K
+
+        def residual(xu):
+            x, u = xu[:N], xu[N:N+1]
+            dxdt = nonlinear.derivatives(x, u, np.array([T_in, omega_in_op]))
+            y    = np.mean(x[:K]) - T_out_target   # mean of parallel air segments matches C matrix
+            return np.concatenate([dxdt, [y]])
+
+        x0 = np.concatenate([
+            np.linspace(T_in, T_out_target, K),   # air: ramp from inlet to target
+            np.full(K, nonlinear.water_supply_T),  # water: start at supply temp
+        ])
+        result = root(residual, np.concatenate([x0, [0.3]]))
         if not result.success:
-            raise ValueError(f"Equilibrium search failed: {result.message}")
-        print(f"  Equilibrium found. Max residual: {np.abs(nonlinear.derivatives(result.x, u_op, d_op)).max():.2e}")
-        return result.x
+            raise ValueError(
+                f"Valve search failed for T_in={T_in-273.15:.1f}°C → "
+                f"T_out={T_out_target-273.15:.1f}°C: {result.message}"
+            )
+        x_eq = result.x[:N]
+        u_eq = float(np.clip(result.x[N], 0.0, 1.0))
+        print(f"  Valve position: {u_eq:.4f}  "
+              f"(residual: {np.abs(residual(result.x)).max():.2e})")
+        return x_eq, u_eq
 
-    def _construct_air_state_block(self):
-        # Spin up nonlinear version with identical parameters
+    def _construct_air_state_block(self, T_in_op: float, T_out_target: float):
         nonlinear = NonlinearHeatExchanger(**self._kwargs)
-                
+
+        # Operating-point specific humidity at the inlet, held fixed during linearisation
+        omega_in_op = nonlinear._omega(T_in_op, nonlinear.relative_humidity_in_system)
+
+        x_eq, u_eq = self._find_valve_for_setpoint(nonlinear, T_in_op, T_out_target, omega_in_op)
+        self.valve_operation_point        = u_eq
+        T_eq     = x_eq[:self.K]
+        theta_eq = x_eq[self.K:]
+        self.theta_return_operation_point = theta_eq[-1]
+
+        # Wrap the cooler derivative so omega_in_op is fixed — only T_in, T_out, theta vary in the Jacobian
         if self.type == "cooler":
-            T_in_op = self.T_operational_in_cooler
+            def seg_deriv(T_in, T_out, theta):
+                return nonlinear._air_cooler_segment_derivative(T_in, T_out, theta, omega_in_op)
         else:
-            # Heater 
-            T_in_op = self.T_operational_in_heater
-            
-        d_op = np.array([T_in_op])
-        u_op = np.array([self.valve_operation_point])
-
-        # Find equilibrium
-        x_eq      = self._find_equilibrium(nonlinear, u_op, d_op)
-        T_eq     = x_eq[:self.K]   # air temperatures at equilibrium, one per segment
-        theta_eq = x_eq[self.K:]   # water temperatures at equilibrium, one per segment
-        self.theta_return_operation_point = theta_eq[-1] # set return water temp operation point to last segment's water temp at equilibrium
-
-        seg_deriv = (nonlinear._air_cooler_segment_derivative if self.type == "cooler"
-                     else nonlinear._air_heater_segment_derivative)
+            seg_deriv = nonlinear._air_heater_segment_derivative
 
         A_air      = np.zeros((self.K, self.K * 2))
         B_air      = np.zeros((self.K, 1))
@@ -402,13 +788,9 @@ class LinearHeatExchanger(BaseHeatExchanger):
             theta_op = theta_eq[k]
 
             f0 = seg_deriv(T_in_op, T_out_op, theta_op)
-
-            # Central finite differences
-            a = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op)) / (2*self.eps)
-            b = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op)) / (2*self.eps)
-            c = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps)) / (2*self.eps)
-
-            # Affine offset
+            a  = (seg_deriv(T_in_op + self.eps, T_out_op, theta_op) - seg_deriv(T_in_op - self.eps, T_out_op, theta_op)) / (2*self.eps)
+            b  = (seg_deriv(T_in_op, T_out_op + self.eps, theta_op) - seg_deriv(T_in_op, T_out_op - self.eps, theta_op)) / (2*self.eps)
+            c  = (seg_deriv(T_in_op, T_out_op, theta_op + self.eps) - seg_deriv(T_in_op, T_out_op, theta_op - self.eps)) / (2*self.eps)
             d_const = f0 - a*T_in_op - b*T_out_op - c*theta_op
 
             A_air[k, k]          = b   # ∂f/∂T_out — self damping
@@ -420,32 +802,22 @@ class LinearHeatExchanger(BaseHeatExchanger):
 
         return A_air, B_air, offset_air
 
-    def _construct_matrix_state_space(self):
-        
-        A = np.zeros((self.N, self.N)) # State matrix
-        B_u = np.zeros((self.N, 1)) # Input matrix for valve position - Controllable input
-        B_d = np.zeros((self.N, 1)) # Input matrix for air inlet temperature - Disturbance input
-        C = np.zeros((1, self.N)) # Output matrix
+    def _construct_matrix_state_space(self, T_in_op: float, T_out_target: float):
+        A      = np.zeros((self.N, self.N))
+        B_u    = np.zeros((self.N, 1))
+        B_d    = np.zeros((self.N, 1))
+        C      = np.zeros((1, self.N))
         Offset = np.zeros((self.N, 1))
 
-        A_air, B_air, offset_air = self._construct_air_state_block()
+        A_air, B_air, offset_air     = self._construct_air_state_block(T_in_op, T_out_target)
         A_water, B_water, offset_water = self._construct_water_state_block()
 
-        # A
-        ## Air dynamics
         A[:self.K, :] = A_air
-
-        ## Water dynamics
         A[self.K:, :] = A_water
-        
-        # B 
-        B_u[self.K:,0] = B_water.flatten()
-        B_d[0:self.K, 0] = B_air.flatten()
-        
-        # Constant offset
+        B_u[self.K:, 0]    = B_water.flatten()
+        B_d[0:self.K, 0]   = B_air.flatten()
         Offset = np.vstack([offset_air, offset_water])
-
-        C[0, :self.K] = 1 / self.K # Average air temperature across segments as output
+        C[0, :self.K] = 1 / self.K   # output = mean of parallel air segments
 
         return A, B_u, B_d, Offset, C
     
@@ -508,14 +880,13 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
 
         return mass_flow_dry_air
 
-    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float) -> float:
-        # Cooler specific assumptions 
+    def _air_cooler_segment_derivative(self, T_in: float, T_out: float, theta: float, omega_in: float) -> float:
+        # Cooler specific assumptions
         relative_humidity = 1
         L = 2500.9 * 1000 # [J/kg]
         T_ref = 273.15 # [K]
-                
+
         # omega
-        omega_in = self._omega(T_in, self.relative_humidity_in_system)
         omega_out = self._omega(T_out, relative_humidity) # [Kg/Kg]
         domega_dT_out = self._domega_dT_out(T_out, relative_humidity)
         
@@ -568,25 +939,26 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
         Compute dx/dt for the full nonlinear system.
 
         Args:
-            x (np.ndarray): [T_1..T_K, θ_1..θ_K], shape (2K,)
-            u (np.ndarray): [valve_position],           shape (1,)
-            d (np.ndarray): [T_in],                     shape (1,)
+            x (np.ndarray): [T_1..T_K, θ_1..θ_K],          shape (2K,)
+            u (np.ndarray): [valve_position],                 shape (1,)
+            d (np.ndarray): [T_in, inlet_specific_humidity],  shape (2,)
         """
-        T     = x[:self.K]
-        theta = x[self.K:]
-        T_in = d[0] # Air inlet temperature is treated as a disturbance input
-        valve_position = u[0] # Valve position is the control input
+        air_temperature_segments   = x[:self.K]
+        water_temperature_segments = x[self.K:]
+        inlet_air_temperature      = d[0]
+        inlet_specific_humidity    = d[1]
+        valve_position             = u[0]
 
-        theta_in = self._valve_model(Valve_position=valve_position, theta_return=theta[-1])
+        theta_in = self._valve_model(Valve_position=valve_position, theta_return=water_temperature_segments[-1])
 
         if self.type == "cooler":
-            dT_dt = np.array([self._air_cooler_segment_derivative(T_in, T[k], theta[k]) for k in range(self.K)])
-        else: # heater
-            dT_dt = np.array([self._air_heater_segment_derivative(T_in, T[k], theta[k]) for k in range(self.K)])
+            dT_dt = np.array([self._air_cooler_segment_derivative(inlet_air_temperature, air_temperature_segments[k], water_temperature_segments[k], inlet_specific_humidity) for k in range(self.K)])
+        else:
+            dT_dt = np.array([self._air_heater_segment_derivative(inlet_air_temperature, air_temperature_segments[k], water_temperature_segments[k]) for k in range(self.K)])
 
-        dtheta_dt = np.array([self._water_segment_derivative(T[k],
-                theta_in if k == 0 else theta[k - 1],
-                theta[k],
+        dtheta_dt = np.array([self._water_segment_derivative(air_temperature_segments[k],
+                theta_in if k == 0 else water_temperature_segments[k - 1],
+                water_temperature_segments[k],
             )
             for k in range(self.K)
         ])
@@ -595,17 +967,19 @@ class NonlinearHeatExchanger(BaseHeatExchanger):
     
 # - - - - - - - - - - - - - - - - Airduct - - - - - - - - - - - - - - - -
 class AirDuctModel:
+    """
+    Linear advection model for an air duct.
+    Also serves as the assembly component for HVAC (both linear and nonlinear paths).
+
+    No valve → is_actuated = False  (no column added to global B_u).
+    No control output → is_output = False  (no row added to global C).
+    C is still used internally for inter-component air coupling (last segment = outlet).
+    """
+    is_actuated = False
+    is_output   = False
+
     def __init__(self, volume_flow_rate=1, cross_section_area=2,
                  duct_length=10, num_segments=10):
-        """
-        Initialize the air duct model.
-
-        Args:
-            volume_flow_rate (float):   Volumetric flow rate [m³/s]
-            cross_section_area (float): Cross-sectional area of the duct [m²]
-            duct_length (float):        Length of the duct [m]
-            num_segments (int):         Number of segments to discretize into
-        """
         self.q_a   = volume_flow_rate
         self.A_a   = cross_section_area
         self.L     = duct_length
@@ -614,53 +988,28 @@ class AirDuctModel:
         self.dz    = self.L / self.K
         self.alpha = self.q_a / (self.A_a * self.dz)
 
-        self.initial_state = np.zeros(self.N)
-        self.A, self.B = self._construct_state_space()
+        self.A, self.B_d = self._construct_state_space()
+        self.B_u         = np.zeros((self.N, 1))
+        self.C           = np.zeros((1, self.N))
+        self.C[0, -1]    = 1.0          # last segment = air outlet
+        self.Offset      = np.zeros((self.N, 1))
 
     @property
     def num_states(self):
-        """Total number of states — 1 per segment."""
         return self.N
 
     def _construct_state_space(self):
-        """
-        Construct state-space matrices for dT/dt = A·T + B·u.
-
-        Returns:
-            A (ndarray): State matrix [N x N]
-            B (ndarray): Input matrix [N x 1]
-        """
         A = np.zeros((self.K, self.K))
         for k in range(self.K):
             A[k, k] = -self.alpha
             if k > 0:
                 A[k, k - 1] = self.alpha
-
-        B = np.zeros((self.K, 1))
-        B[0, 0] = self.alpha
-        return A, B
-
-    def set_initial_temperature(self, temperature_C):
-        """
-        Set uniform initial temperature for all segments.
-
-        Args:
-            temperature_C (float): Initial temperature [°C]
-        """
-        self.initial_state = np.full(self.N, temperature_C + 273.15)
+        B_d = np.zeros((self.K, 1))
+        B_d[0, 0] = self.alpha
+        return A, B_d
 
     def derivatives(self, T, u):
-        """
-        Compute dT/dt given current state and input.
-
-        Args:
-            T (ndarray): Current segment temperatures [K]
-            u (float):   Inlet temperature [K]
-
-        Returns:
-            dTdt (ndarray): Temperature derivatives [K/s]
-        """
-        return self.A @ T + self.B.flatten() * u
+        return self.A @ T + self.B_d.flatten() * u
 
 # - - - - - - - - - - - - - - - - Junction - - - - - - - - - - - - - - - -
 class Junction:
